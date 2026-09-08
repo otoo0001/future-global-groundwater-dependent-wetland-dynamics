@@ -49,11 +49,11 @@
 #     "topography_30sec_03sec")
 
 # PERSISTENCE_TIF = Path(
-#     "/path/to/scratch/paper_2/revisions/shapefiles_from/"
+#     "/path/to/shapefiles/"
 #     "wetgde_max_presence_mask_2015_2019.tif")
 
 # OUT = Path(
-#     "/path/to/scratch/paper_3/new_outputs/"
+#     "/path/to/outputs/"
 #     "sensitivity/subgrid_wtd_actual")
 # OUT.mkdir(parents=True, exist_ok=True)
 
@@ -395,11 +395,11 @@
 #     "average_gswp3-w5e5.zarr")
 
 # PERSISTENCE_TIF = Path(
-#     "/path/to/scratch/paper_2/revisions/shapefiles_from/"
+#     "/path/to/shapefiles/"
 #     "wetgde_max_presence_mask_2015_2019.tif")
 
 # OUT = Path(
-#     "/path/to/scratch/paper_3/new_outputs/"
+#     "/path/to/outputs/"
 #     "sensitivity/subgrid_wtd_actual")
 # OUT.mkdir(parents=True, exist_ok=True)
 
@@ -767,12 +767,12 @@ WTD_ZARR = Path(
 )
 
 PERSISTENCE_TIF = Path(
-    "/path/to/scratch/paper_2/revisions/shapefiles_from/"
+    "/path/to/shapefiles/"
     "wetgde_max_presence_mask_2015_2019.tif"
 )
 
 OUT = Path(
-    "/path/to/scratch/paper_3/new_outputs/"
+    "/path/to/outputs/"
     "sensitivity/subgrid_wtd_actual"
 )
 OUT.mkdir(parents=True, exist_ok=True)

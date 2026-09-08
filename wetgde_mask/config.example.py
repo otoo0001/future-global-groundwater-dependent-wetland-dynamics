@@ -25,7 +25,7 @@ import os
 # ---------------- Directories ----------------
 SAT_DIR  = "/projects/prjs1578/sat_future"
 WTD_ROOT = "/projects/prjs1222/globgm_output/cmip6/monthly"
-OUT_DIR  = "/path/to/scratch/paper_3/new_outputs/WetGDEs/ensemble"
+OUT_DIR  = "/path/to/WetGDEs/ensemble"
 
 # WTD zarr config
 WTD_MODEL  = "ensemble"
@@ -63,7 +63,7 @@ COMPLEVEL = 4
 
 # ---------------- Metadata ----------------
 AUTHOR           = "Nicole Gyakowah Otoo"
-EMAIL            = "n.g.otoo@uu.nl, REMOVED"
+EMAIL            = "n.g.otoo@uu.nl"
 INSTITUTION      = "Department of Physical Geography, Utrecht University"
 SUPERVISOR       = "Edwin H. Sutanudjaja"
 SUPERVISOR_EMAIL = "E.H.Sutanudjaja@uu.nl"

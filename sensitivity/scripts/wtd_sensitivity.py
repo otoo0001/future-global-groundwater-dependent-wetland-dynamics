@@ -51,23 +51,23 @@ WTD_ZARR = Path(
 )
 
 INTERSECTION_TIF = Path(
-    "/path/to/scratch/from_projects/validation/input_files/"
+    "/path/to/validation/input_files/"
     "rhodes_2024_gde/Rhodes/glwd_rhodes_intersection_for_validation/"
     "glwd_rhodes_intersection_binary_no_open.tif"
 )
 
 DRYLAND_MASK_TIF = Path(
-    "/path/to/scratch/from_projects/validation/input_files/"
+    "/path/to/validation/input_files/"
     "koppen_geiger/1991_2020/koppen_geiger_0p5.tif"
 )
 
 GLWD_CLASS_TIF = Path(
-    "/path/to/scratch/from_projects/validation/input_files/"
+    "/path/to/validation/input_files/"
     "glwd/GLWD_v2_delta_combined_classes/GLWD_v2_delta_main_class.tif"
 )
 
 OUTDIR = Path(
-    "/path/to/scratch/paper_3/new_outputs/"
+    "/path/to/outputs/"
     "sensitivity/plots/wtd_sat_sensitivity_validation_monthly_2km_tolerance"
 )
 OUTDIR.mkdir(parents=True, exist_ok=True)

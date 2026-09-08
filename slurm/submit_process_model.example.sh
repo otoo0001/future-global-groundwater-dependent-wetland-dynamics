@@ -6,25 +6,25 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=600G
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=REMOVED
-#SBATCH --output=/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi/logs/slurm_%x_%j.out
+#SBATCH --mail-user=your.email@example.com
+#SBATCH --output=/path/to/WetGDEs_fgdw_gdi/logs/slurm_%x_%j.out
 #SBATCH --open-mode=truncate
-#SBATCH --error=/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi/logs/slurm_%x_%j.err
+#SBATCH --error=/path/to/WetGDEs_fgdw_gdi/logs/slurm_%x_%j.err
 #SBATCH --export=ALL
 
 set -euo pipefail
-set +u; . "/path/to/user/load_all_default.sh"; set -u
+# Load site-specific environment/modules here if required.
 
-PYBIN="/path/to/user/.conda/envs/gdes_area/bin/python"
+PYBIN="${PYBIN:-python}"
 if [ ! -x "${PYBIN}" ]; then echo "[error] python not found: ${PYBIN}"; exit 2; fi
 echo "[env] python=${PYBIN}"; "${PYBIN}" -V
 
-mkdir -p /path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi/logs
+mkdir -p /path/to/WetGDEs_fgdw_gdi/logs
 
 # ── output paths ──────────────────────────────────────────────────────────────
-export OUT_NC_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi"
-export OUT_PARQUET_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi"
-export LOG_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi/logs"
+export OUT_NC_DIR="/path/to/WetGDEs_fgdw_gdi"
+export OUT_PARQUET_DIR="/path/to/WetGDEs_fgdw_gdi"
+export LOG_DIR="/path/to/WetGDEs_fgdw_gdi/logs"
 
 # ── run flags ─────────────────────────────────────────────────────────────────
 export RUN_PROCESS_MODEL=1

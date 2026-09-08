@@ -1,4 +1,4 @@
-# Future groundwater-dependent wetland projections
+# Future global groundwater-dependent wetland dynamics
 
 This repository contains the modelling and analysis code used to assess historical and future changes in groundwater-dependent wetlands (WetGDEs).
 
@@ -9,7 +9,7 @@ The workflow combines groundwater-table depth, saturated-area fractions and land
 ## Repository structure
 
 ```text
-future_gdes_new_v2026/
+future-global-groundwater-dependent-wetland-dynamics/
 ├── environment.yml
 ├── README.md
 ├── docs/
@@ -22,12 +22,33 @@ future_gdes_new_v2026/
 │   └── scripts/
 ├── slurm/
 │   ├── job_scripts_msc/
-│   ├── submit_combined.sh
-│   ├── submit_gcms.sh
-│   ├── submit_mask.sh
-│   └── submit_process_model.sh
+│   ├── submit_combined.example.sh
+│   ├── submit_gcms.example.sh
+│   ├── submit_mask.example.sh
+│   └── submit_process_model.example.sh
 ├── wetgde_mask/
+│   ├── config.example.py
+│   ├── grid_utils.py
+│   ├── __init__.py
+│   ├── io.py
+│   ├── pipeline.py
+│   └── writer.py
 └── wetgde_model/
+    ├── area.py
+    ├── config.example.py
+    ├── dependency.py
+    ├── feedback.py
+    ├── __init__.py
+    ├── io_utils.py
+    ├── loss.py
+    ├── lu_utils.py
+    ├── mask.py
+    ├── pcr_io.py
+    ├── pipeline.py
+    ├── qa_utils.py
+    ├── run.py
+    ├── uncertainty.py
+    └── writers.py
 ```
 
 ### `wetgde_mask/`
@@ -55,9 +76,11 @@ Contains scripts used to evaluate the sensitivity of WetGDE estimates to methodo
 
 ### `slurm/`
 
-Contains SLURM submission scripts used to run the analyses on the Snellius national supercomputer.
+Contains public templates of the SLURM submission scripts used to run the analyses on the Snellius national supercomputer.
 
 Additional processing, evaluation and plotting scripts are retained under `slurm/job_scripts_msc/`.
+
+Machine-specific submission scripts are excluded from version control.
 
 ---
 
@@ -254,13 +277,48 @@ The environment includes the principal scientific and geospatial Python packages
 
 ---
 
+# Configuration
+
+Machine-specific configuration files are not distributed with this repository.
+
+Public configuration templates are provided as:
+
+```text
+wetgde_mask/config.example.py
+wetgde_model/config.example.py
+```
+
+After cloning the repository, create local configuration files:
+
+```bash
+cp wetgde_mask/config.example.py wetgde_mask/config.py
+cp wetgde_model/config.example.py wetgde_model/config.py
+```
+
+Edit the resulting `config.py` files to provide the locations of the required input datasets and output directories on the local system.
+
+The local files:
+
+```text
+wetgde_mask/config.py
+wetgde_model/config.py
+```
+
+are excluded from version control.
+
+This allows machine-specific paths and local settings to remain separate from the public repository.
+
+The scientific settings in the example configuration files should be checked against the requirements of the analysis before running the workflow.
+
+---
+
 # Running the workflow
 
 Commands should be executed from the repository root.
 
 ## 1. Run the WetGDE workflow
 
-Run the WetGDE calculation using:
+After creating and configuring `wetgde_mask/config.py`, run:
 
 ```bash
 python scripts/run_wetgde_paper3.py
@@ -278,7 +336,7 @@ SCENARIO=ssp370 python scripts/run_wetgde_paper3.py
 
 ## 2. Run the process-based analyses
 
-Run the process-based analyses using:
+After creating and configuring `wetgde_model/config.py`, run:
 
 ```bash
 RUN_PROCESS_MODEL=1 python scripts/run_process_model.py
@@ -317,53 +375,62 @@ Completed model runs can be checked using:
 python scripts/validate_all_runs.py
 ```
 
+The output directory used by the validation script can be configured for the local system.
+
 ---
 
 # Running on Snellius
 
-The simulations used for this study were executed on the Snellius national supercomputer.
+The simulations used in this study were executed on the Snellius national supercomputer.
 
-The main SLURM submission scripts are:
+Public templates of the principal SLURM submission scripts are provided:
 
 ```text
 slurm/
-├── submit_mask.sh
-├── submit_gcms.sh
-├── submit_combined.sh
-├── submit_process_model.sh
+├── submit_mask.example.sh
+├── submit_gcms.example.sh
+├── submit_combined.example.sh
+├── submit_process_model.example.sh
 └── job_scripts_msc/
 ```
 
-## Submit the GCM workflow
+Additional SLURM templates are provided under `slurm/job_scripts_msc/` and `sensitivity/scripts/`.
+
+The `.example.sh` files contain public versions of the submission scripts. Machine-specific paths and local settings used for the original simulations are excluded from version control.
+
+Before using a submission script, copy the required template to a local `.sh` file.
+
+For example:
+
+```bash
+cp slurm/submit_gcms.example.sh slurm/submit_gcms.sh
+```
+
+Then adapt the local script for the target system, including:
+
+* input and output paths;
+* Python or Conda environment;
+* SLURM partition and account settings;
+* memory and CPU requirements;
+* log locations; and
+* other machine-specific settings.
+
+After configuration, submit the job using:
 
 ```bash
 sbatch slurm/submit_gcms.sh
 ```
 
-## Submit the process-model workflow
-
-```bash
-sbatch slurm/submit_process_model.sh
-```
-
-## Submit the combined workflow
-
-```bash
-sbatch slurm/submit_combined.sh
-```
-
-Other processing stages can be submitted using the corresponding scripts under `slurm/` and `slurm/job_scripts_msc/`.
-
-The supplied SLURM files retain computational settings used on Snellius. Paths, Conda environment locations, partitions, memory requirements and other HPC-specific settings may need to be modified when running the workflow on another system.
+The same procedure can be used for the other `.example.sh` submission scripts.
 
 ---
 
 # Outputs
 
-The main output directory used for the original simulations is:
+A generic representation of the main output directory is:
 
 ```text
-/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/
+/path/to/WetGDEs_fgdw_v3/
 ```
 
 Individual GCM results are organised by climate model and scenario.
@@ -555,12 +622,10 @@ The Parquet products provide compact regional time series for temporal analyses,
 
 The generated NetCDF and Parquet files can be inspected directly from the command line before further analysis.
 
-The following examples use the output directory from the original Snellius simulations.
-
-First define the base directory:
+First define the local output directory:
 
 ```bash
-BASE="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3"
+BASE="/path/to/WetGDEs_fgdw_v3"
 ```
 
 ## List available outputs
@@ -603,7 +668,6 @@ import xarray as xr
 path = sys.argv[1]
 
 with xr.open_dataset(path) as ds:
-
     print("\nDataset:")
     print(ds)
 
@@ -647,9 +711,7 @@ variables = [
 ]
 
 with xr.open_dataset(path) as ds:
-
     for name in variables:
-
         if name not in ds:
             continue
 
@@ -658,7 +720,6 @@ with xr.open_dataset(path) as ds:
         print("\n" + "=" * 60)
         print(name)
         print("=" * 60)
-
         print("Minimum :", float(da.min(skipna=True).compute()))
         print("Maximum :", float(da.max(skipna=True).compute()))
         print("Mean    :", float(da.mean(skipna=True).compute()))
@@ -717,7 +778,7 @@ This displays the dimensions of the table, column names, data types, example rec
 The following example automatically selects the first NetCDF and Parquet files found in the output directory:
 
 ```bash
-BASE="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3"
+BASE="/path/to/WetGDEs_fgdw_v3"
 
 NC=$(find "$BASE" -type f -name "*.nc" | head -1)
 PQ=$(find "$BASE" -type f -name "*.parquet" | head -1)
@@ -726,10 +787,10 @@ echo "============================================================"
 echo "NETCDF"
 echo "============================================================"
 echo "$NC"
-
 ncdump -h "$NC"
 
 echo
+
 echo "============================================================"
 echo "PARQUET"
 echo "============================================================"
@@ -740,6 +801,7 @@ import sys
 import pandas as pd
 
 path = sys.argv[1]
+
 df = pd.read_parquet(path)
 
 print("\nShape:", df.shape)
@@ -787,7 +849,7 @@ This provides a quick check that the required historical and SSP simulations hav
 
 # Output validation
 
-The repository also contains an output-validation script:
+The repository contains an output-validation script:
 
 ```text
 scripts/validate_all_runs.py
@@ -801,20 +863,27 @@ python scripts/validate_all_runs.py
 
 The validation stage is intended to identify missing or incomplete model outputs before downstream analyses are performed.
 
+The output location can be configured for the local computing environment.
+
 ---
 
 # Data availability
 
 Large model inputs and outputs are not stored directly in this GitHub repository.
 
-The GLOBGM groundwater simulations are available from the external repositories listed above.
+The GLOBGM groundwater simulations used by the workflow are available from the external repositories and data archives listed above.
 
-Processed WetGDE outputs associated with this study will be archived on Zenodo.
+Saturated-area fractions are derived using the external `pgb_sat_area_frac` workflow referenced above.
+
+Processed WetGDE outputs associated with this study will be archived and published through the Utrecht University Yoda research data infrastructure.
 
 **Processed WetGDE outputs:**
-Zenodo DOI/link to be added after deposit.
 
-The Zenodo archive will contain the processed outputs required to reproduce the principal analyses and figures associated with the study.
+DOI/link to be added after publication.
+
+The data archive will contain the processed outputs required to reproduce the principal analyses and figures associated with the study.
+
+The GitHub repository contains the corresponding modelling, processing, sensitivity, evaluation and plotting code.
 
 ---
 
@@ -827,9 +896,9 @@ This repository provides:
 * sensitivity-analysis scripts;
 * GCM and ensemble-processing workflows;
 * output-validation scripts;
-* SLURM scripts used for the HPC calculations; and
+* public templates of the SLURM scripts used for the HPC calculations; and
 * the Conda environment specification.
 
 Full reproduction requires access to the corresponding GLOBGM simulations, saturated-area fractions, land-use information and other external input datasets described above.
 
-Machine-specific paths in the configuration and SLURM files must be adapted when the workflow is run outside the original Snellius computing environment.
+Machine-specific configuration and submission files are excluded from version control. Public templates are provided and must be adapted to the local computing environment before use.

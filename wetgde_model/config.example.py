@@ -114,23 +114,23 @@ class Config:
     # ---- input: QA ----
     qa_dir: str = _env(
         "QA_DIR",
-        "/path/to/scratch/from_projects/futurewetgde/quality_flags/",
+        "/path/to/from_projects/futurewetgde/quality_flags/",
     )
 
     # ---- input: open water mask ----
     open_water_mask_tif: str = _env(
         "OPEN_WATER_MASK_TIF",
-        "/path/to/scratch/glwd_rebuilt_masks/glwd_open_water_mask.tif",
+        "/path/to/glwd_rebuilt_masks/glwd_open_water_mask.tif",
     )
 
     # ---- input: PCR land use ----
     pcr_corrected_root: str = _env(
         "PCR_CORRECTED_ROOT",
-        "/path/to/scratch/from_projects/futurewetgde/quality_flags/future_agric_area/pcr_irrigated_corrected",
+        "/path/to/from_projects/futurewetgde/quality_flags/future_agric_area/pcr_irrigated_corrected",
     )
     pcr_root: str = _env(
         "PCR_ROOT",
-        "/path/to/scratch/from_projects/futurewetgde/quality_flags/future_agric_area/pcr_irrigated",
+        "/path/to/from_projects/futurewetgde/quality_flags/future_agric_area/pcr_irrigated",
     )
 
     # ---- input: PCR ISIMIP3 diagnostics (gwRecharge, actualET, precipitation) ----
@@ -143,7 +143,7 @@ class Config:
     # ---- cell area file ----
     cell_area_path: str = _env(
         "CELL_AREA_PATH",
-        "/path/to/scratch/paper_2/revisions/shapefiles/cellsize05min.nc",
+        "/path/to/paper_2/revisions/shapefiles/cellsize05min.nc",
     )
     cell_area_var: str = _env("CELL_AREA_VAR", "cell_area")
     cell_area_units: str = _env("CELL_AREA_UNITS", "m2")
@@ -151,21 +151,21 @@ class Config:
     # ---- output paths ----
     out_nc_dir: str = _env(
         "OUT_NC_DIR",
-        "/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi",
+        "/path/to/paper_3/new_outputs/WetGDEs_fgdw_gdi",
     )
     out_parquet_dir: str = _env(
         "OUT_PARQUET_DIR",
-        "/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi",
+        "/path/to/paper_3/new_outputs/WetGDEs_fgdw_gdi",
     )
     log_dir: str = _env(
         "LOG_DIR",
-        "/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_gdi/logs",
+        "/path/to/paper_3/new_outputs/WetGDEs_fgdw_gdi/logs",
     )
 
     # ---- shapefile ----
     biome_shp: str = _env(
         "BIOME_SHP",
-        "/path/to/scratch/from_projects/futurewetgde/shapefiles/biomes_new/biomes/wwf_terr_ecos.shp",
+        "/path/to/from_projects/futurewetgde/shapefiles/biomes_new/biomes/wwf_terr_ecos.shp",
     )
 
     # ---- standard thresholds ----
@@ -261,7 +261,7 @@ class Config:
     @property
     def pcr_files(self) -> Dict[str, dict]:
         lu_dir = Path(
-            "/path/to/scratch/from_projects/futurewetgde"
+            "/path/to/from_projects/futurewetgde"
             "/quality_flags/future_agric_area/pcr_irrigated/lu_total_2014_2015split"
         )
         hist = lu_dir / "lu_total_hist_ssp2_1970-2014_clamp01.nc"

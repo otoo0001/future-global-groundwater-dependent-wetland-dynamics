@@ -6,25 +6,25 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=300G
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=REMOVED
-#SBATCH --output=/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/logs/slurm_%x_%j.out
+#SBATCH --mail-user=your.email@example.com
+#SBATCH --output=/path/to/WetGDEs_fgdw_v3/logs/slurm_%x_%j.out
 #SBATCH --open-mode=truncate
-#SBATCH --error=/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/logs/slurm_%x_%j.err
+#SBATCH --error=/path/to/WetGDEs_fgdw_v3/logs/slurm_%x_%j.err
 #SBATCH --export=ALL
 
 set -euo pipefail
-set +u; . "/path/to/user/load_all_default.sh"; set -u
+# Load site-specific environment/modules here if required.
 
-PYBIN="/path/to/user/.conda/envs/gdes_area/bin/python"
+PYBIN="${PYBIN:-python}"
 if [ ! -x "${PYBIN}" ]; then echo "[error] python not found: ${PYBIN}"; exit 2; fi
 echo "[env] python=${PYBIN}"; "${PYBIN}" -V
 
-mkdir -p /path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/logs
+mkdir -p /path/to/WetGDEs_fgdw_v3/logs
 
 # ── output paths (v3) ─────────────────────────────────────────────────────────
-export OUT_NC_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3"
-export OUT_PARQUET_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3"
-export LOG_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/logs"
+export OUT_NC_DIR="/path/to/WetGDEs_fgdw_v3"
+export OUT_PARQUET_DIR="/path/to/WetGDEs_fgdw_v3"
+export LOG_DIR="/path/to/WetGDEs_fgdw_v3/logs"
 
 # ── run flags ─────────────────────────────────────────────────────────────────
 export RUN_GCMS=1
@@ -43,7 +43,7 @@ export LU_FREEZE_END=2014
 
 # ── WTD climatology ───────────────────────────────────────────────────────────
 export WTD_CLIM_WINDOW="1995-01-01,2014-12-31"
-export WTD_CLIM_CACHE_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/wtd_clim_cache"
+export WTD_CLIM_CACHE_DIR="/path/to/WetGDEs_fgdw_v3/wtd_clim_cache"
 
 # ── time ──────────────────────────────────────────────────────────────────────
 export START_YEAR="${START_YEAR:-1979}"
@@ -67,7 +67,7 @@ export PYTHONUNBUFFERED=1
 export TMPDIR="${SLURM_TMPDIR:-/tmp}"
 
 echo "========== $(date) JOB=$SLURM_JOB_ID GCM=${GCM:-ALL} SCENARIO=${SCENARIO:-ALL} ==========" \
-  >> /path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/logs/all_errors.log
+  >> /path/to/WetGDEs_fgdw_v3/logs/all_errors.log
 
 echo "=== wetGDE v3 GCM run ==="
 echo "GCM: ${GCM}  SCENARIO: ${SCENARIO}  START_YEAR: ${START_YEAR}  END_YEAR: ${END_YEAR}"
@@ -75,4 +75,4 @@ echo "OUT_NC_DIR: ${OUT_NC_DIR}"
 
 cd ~/github/paper_3/future_gdes_new_v2026
 /usr/bin/time -v "${PYBIN}" -u -X faulthandler wetgde_model/run.py 2>&1 \
-  | tee -a /path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/logs/all_errors.log
+  | tee -a /path/to/WetGDEs_fgdw_v3/logs/all_errors.log

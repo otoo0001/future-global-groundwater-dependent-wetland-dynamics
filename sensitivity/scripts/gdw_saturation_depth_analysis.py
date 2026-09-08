@@ -37,7 +37,7 @@ except Exception:
 
 
 WTD_ZARR = "/projects/prjs1222/globgm_output/historical_reference/monthly/gswp3-w5e5.zarr"
-PERS_MASK = "/path/to/scratch/paper_2/revisions/shapefiles_from/wetgde_max_presence_mask_2015_2019.tif"
+PERS_MASK = os.environ.get("WETGDE_PERSISTENCE_MASK", "/path/to/wetgde_max_presence_mask_2015_2019.tif")
 
 TOPO_DIR = "/projects/prjs1222/globgm_input/_data/globgm_input/topography_30sec_03sec"
 TOPO_TPL = TOPO_DIR + "/dzRel{p}_topography_parameters_30sec_february_2021_global_covered_with_zero.nc"
@@ -51,7 +51,7 @@ PCTS = [
 YEARS = slice("2015", "2019")
 OUTLIER_PERCENTILE = 98
 
-OUT_DIR = "/path/to/scratch/paper_3/future_gdes_new_v2026/sensitivity/outputs"
+OUT_DIR = os.environ.get("WETGDE_SENSITIVITY_OUT", "./sensitivity/outputs")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 OUT_MAP = f"{OUT_DIR}/global_dem_based_subgrid_groundwater_depth.png"

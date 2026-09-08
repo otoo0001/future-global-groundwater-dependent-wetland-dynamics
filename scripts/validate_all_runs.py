@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import os
 
-BASE = Path("/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3")
+BASE = Path(os.environ.get("WETGDE_OUTPUT_DIR", "./outputs/WetGDEs_fgdw_v3"))
 
 GCMS = [
     "gfdl-esm4",

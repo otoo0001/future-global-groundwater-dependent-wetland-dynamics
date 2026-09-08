@@ -11,8 +11,8 @@ GCMS=(
 )
 SCENARIOS=("historical" "ssp126" "ssp370" "ssp585")
 
-SCRIPT="/path/to/user/github/paper_3/future_gdes_new_v2026/slurm/submit_gcms.sh"
-LOG_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/logs"
+SCRIPT="/path/to/future_gdes_new_v2026/slurm/submit_gcms.sh"
+LOG_DIR="/path/to/WetGDEs_fgdw_v3/logs"
 mkdir -p "${LOG_DIR}"
 
 echo "Submitting v3 GCM jobs: ${#GCMS[@]} GCMs x ${#SCENARIOS[@]} scenarios = $((${#GCMS[@]} * ${#SCENARIOS[@]})) jobs"
@@ -33,4 +33,4 @@ for gcm in "${GCMS[@]}"; do
     done
 done
 
-echo "All jobs submitted. Monitor with: squeue -u otoo0001"
+echo "All jobs submitted. Monitor with: squeue -u ${USER}"

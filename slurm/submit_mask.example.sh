@@ -6,19 +6,19 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=400G
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=REMOVED
-#SBATCH --output=/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw/logs/slurm_%j_%x.out
-#SBATCH --error=/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw/logs/slurm_%j_%x.err
+#SBATCH --mail-user=your.email@example.com
+#SBATCH --output=/path/to/WetGDEs_fgdw/logs/slurm_%j_%x.out
+#SBATCH --error=/path/to/WetGDEs_fgdw/logs/slurm_%j_%x.err
 #SBATCH --export=NONE
 
 set -euo pipefail
-set +u; . "/path/to/user/load_all_default.sh"; set -u
+# Load site-specific environment/modules here if required.
 
-PYBIN="/path/to/user/.conda/envs/gdes_area/bin/python"
+PYBIN="${PYBIN:-python}"
 if [ ! -x "${PYBIN}" ]; then echo "[error] python not found: ${PYBIN}"; exit 2; fi
 echo "[env] python=${PYBIN}"; "${PYBIN}" -V
 
-mkdir -p /path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw/logs
+mkdir -p /path/to/WetGDEs_fgdw/logs
 
 export SCENARIO="${SCENARIO:-}"
 export SMALL_TEST=0

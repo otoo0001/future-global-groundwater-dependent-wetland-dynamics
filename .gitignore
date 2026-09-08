@@ -39,3 +39,21 @@ venv/
 *.backup
 *.bak.*
 *.backup_*
+
+# Local Snellius submission scripts
+slurm/submit_gcms.sh
+slurm/submit_mask.sh
+slurm/submit_process_model.sh
+slurm/submit_combined.sh
+slurm/job_scripts_msc/submit_all_gdi.sh
+slurm/job_scripts_msc/submit_ensemble_cdo.sh
+sensitivity/scripts/wtd_sensitivity.sh
+
+# Additional SLURM logs
+slurm_*.out
+slurm_*.err
+slurm/job_scripts_msc/check_and_resubmit.sh
+
+# Local HPC configuration
+wetgde_mask/config.py
+wetgde_model/config.py
