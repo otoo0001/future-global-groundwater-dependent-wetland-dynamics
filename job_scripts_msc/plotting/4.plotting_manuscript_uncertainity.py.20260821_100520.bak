@@ -1,0 +1,5050 @@
+#!/usr/bin/env python3
+"""
+Manuscript figures with GCM ensemble uncertainty.
+
+Reviewer-facing changes in this version:
+- Figure 1 map coastlines are thicker and darker.
+- Figure 1b uses the exact same six realm-level per-GCM net changes as
+  Figure 3. Positive realm net changes are summed as gain, negative realm
+  net changes are summed in absolute value as loss, and global net change
+  is their difference. Bars/marker show five-GCM means and whiskers show
+  five-GCM min-max ranges.
+- Figure 5 duplicates Figure 1's four-panel layout but panel b shows only
+  the realm-consistent global net change as a bar with five-GCM min-max
+  whiskers.
+- Figure 1d reports percentages for every loss/gain category, including
+  small land-use gains.
+- Figure 2 saves the global and six-realm time series as separate figures,
+  preserving the realm-panel aspect ratio and explicitly joining 2014 to 2015.
+- Figure 3 separates total GDW and GDW without land-use impact and reports
+  five-GCM min-max ranges.
+- Figure 4 uses clearer coastlines and hatches only biome–realm units
+  where the five GCMs disagree on the sign of change.
+
+- Figure 3 uses four wide lollipop panels, displays the six realm labels once,
+  excludes the global aggregate, reports net change, and shows five-GCM mean
+  and min–max spread with corrected land-use wording.
+
+Earlier structural changes retained:
+- Fig 3: REDESIGNED from a single row of 4 scenario panels (each overlaying
+  two marker types -- Total GDW and GDW-without-landuse -- with dual GCM
+  range lines per realm) to a 2-row x 4-column small-multiple grid: row 1
+  is Total GDW, row 2 is GDW without landuse impact, one marker type and
+  one GCM range per subplot. The overlay design was hard to read because
+  each realm row carried two offset markers, two range lines, and a
+  dashed/solid distinction simultaneously; separating the two metrics into
+  their own row removes that.
+- Fig 1b: gain, loss and net change are derived from the exact same
+  per-GCM realm net changes used by Fig 3. Bars/marker show five-GCM means
+  and all whiskers show the corresponding five-GCM min-max ranges.
+- Fig 1d: grouped (not stacked) bars, with explicit xlim padding so value
+  labels never collide with y-tick labels.
+- Fig 4: GCM sign-agreement hatching at 3-of-5 (60%) threshold.
+- S5: per-pixel GCM standard deviation of area change, companion to Fig 1a.
+  Requires per-GCM timmean files (see open_timmean_da_gcm / the separate
+  generate_gcm_timmean.py script).
+- S8: per biome-realm, number of GCMs agreeing on sign, companion to Fig 4.
+  Color scale now only spans the achievable range (3, 4, 5 out of 5) --
+  with N=5 GCMs a majority can never be below 3/5, so 0/1/2 are impossible
+  and were wasting half the color range.
+- S9: GCM-resolved, error-barred version of Fig 1b/1d, kept separate from
+  the main figure to avoid crowding it.
+- S10 (rebuilt): per-GCM, per-biome-realm area table with both Total GDW
+  and GDW-without-landuse-impact columns side by side, for every GCM,
+  scenario, and biome-realm. This is the individual-model breakdown behind
+  Fig 3 and Fig 4.
+"""
+# Numerical note:
+# Pixel-level gross gain/loss/net calculations are summed in float64.
+# Consistency checks use rtol=1e-6 and atol=1e-4 in units of 10^3 km²
+# (0.1 km² absolute tolerance), preventing harmless floating-point rounding
+# differences from stopping the script while still catching real mismatches.
+
+
+import os
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+os.environ["HDF5_DISABLE_VERSION_CHECK"] = "2"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+from pathlib import Path
+import argparse
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
+import matplotlib.ticker
+from matplotlib.colors import (
+    TwoSlopeNorm, ListedColormap,
+    BoundaryNorm, LinearSegmentedColormap,
+)
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Rectangle
+from matplotlib.gridspec import GridSpec
+from matplotlib import patheffects
+
+import geopandas as gpd
+from rasterio.features import rasterize
+from affine import Affine
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+import matplotlib as mpl
+mpl.rcParams["font.family"] = "sans-serif"
+mpl.rcParams["font.sans-serif"] = ["Arial", "DejaVu Sans", "Helvetica", "Liberation Sans"]
+mpl.rcParams["hatch.linewidth"] = 0.7
+
+try:
+    import cmocean
+    CMAP_DIVERGING = cmocean.cm.curl
+except ImportError:
+    CMAP_DIVERGING = plt.get_cmap("RdBu")
+
+# =============================================================================
+# PATHS
+# =============================================================================
+
+BASE      = Path("/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3")
+ENSEMBLE  = BASE / "ensemble"
+GCMS_BASE = BASE / "gcms"
+OUT       = BASE / "plots" / "figures_uncertainty_reviewer_final"
+WWF_SHAPE = "/path/to/scratch/paper_3/inputs/biomes/biomes/wwf_terr_ecos.shp"
+OUT.mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
+# SETTINGS
+# =============================================================================
+
+GCMS      = ["gfdl-esm4", "ipsl-cm6a-lr", "mpi-esm1-2-hr", "mri-esm2-0", "ukesm1-0-ll"]
+SCENARIOS = ["historical", "ssp126", "ssp370", "ssp585"]
+FUTURE_S  = ["ssp126", "ssp370", "ssp585"]
+MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+COL_TOTAL   = "area_gdw_km2"
+COL_NONLU   = "area_gdw_nonlu_km2"
+COL_GW_ONLY = "area_gdw_freeze_lu_km2"
+COL_LU_ONLY = "area_gdw_freeze_wtd_km2"
+
+PCR_COLS = {
+    "Groundwater Impact Only":       COL_NONLU,
+    "Land-use Impact Only":          COL_LU_ONLY,
+    "Groundwater + Land-use Impact": COL_TOTAL,
+}
+PCR_COLS_NORM = PCR_COLS.copy()
+
+TS_VAR         = COL_TOTAL
+PIXEL_VAR      = COL_TOTAL
+HIST_BASE      = (1995, 2004)
+HIST_LAST      = (2005, 2014)
+FUT_LAST       = (2041, 2050)
+JOIN_YEAR      = 2015
+SMOOTH_YEARS   = 5
+BASELINE_MIN   = 0.01
+PCR_VLIM       = 15
+ABS_PERCENTILE = 95
+
+# GCM sign-agreement threshold for hatching. With N=5 GCMs, 3/5 (60%) is
+# majority agreement; 4/5 (80%) was tested and over-hatched the map.
+AGREEMENT_MIN_FRACTION = 0.6   # retained for supplementary agreement diagnostics
+FIG4_WEAK_CHANGE_THRESHOLD_PCT = 20.0
+
+SCEN_COLOR = {
+    "historical": "#333333",
+    "ssp126":     "#1a9850",
+    "ssp370":     "#fdae61",
+    "ssp585":     "#d73027",
+}
+SCEN_LABEL = {
+    "historical": "Historical",
+    "ssp126":     "SSP1-2.6",
+    "ssp370":     "SSP3-7.0",
+    "ssp585":     "SSP5-8.5",
+}
+
+MERGE_TO    = {"AA", "OC"}
+MERGED_CODE = "AO"
+REALM_NAME  = {
+    "AT": "Afrotropical", "IM": "Indo-Malayan",
+    "NA": "Nearctic",     "NT": "Neotropical",
+    "PA": "Palearctic",   MERGED_CODE: "Australasian & Oceanian",
+}
+REALM_ORDER = [
+    "Nearctic", "Neotropical", "Afrotropical",
+    "Palearctic", "Indo-Malayan", "Australasian & Oceanian",
+]
+
+REALM_TO_CONTINENT = {
+    "Nearctic": "North America",
+    "Neotropical": "South America",
+    "Afrotropical": "Africa",
+    "Palearctic": "Europe & Asia",
+    "Indo-Malayan": "Asia (Indo-Malayan)",
+    "Australasian & Oceanian": "Oceania",
+}
+
+FS = {
+    "panel":  22,
+    "title":  20,
+    "axis":   18,
+    "tick":   16,
+    "legend": 16,
+    "value":  16,
+    "small":  14,
+}
+S = 4.5
+
+# Enlarged fonts for Figures 1 and 3. These figures were drawn on very large
+# canvases (30 and 29 inches wide), so their nominal font sizes printed at
+# roughly a quarter of their apparent size once reduced to column width. The
+# canvases in the patched functions are smaller and the fonts larger; the
+# ratio of font size to figure width, not the font size alone, controls
+# printed legibility.
+FS1 = {          # Figure 1, drawn on 17.5 x 12.25 inches
+    "panel":  30,
+    "title":  26,
+    "axis":   24,
+    "tick":   21,
+    "legend": 21,
+    "value":  20,
+    "small":  19,
+}
+
+FS3 = {          # Figure 3, drawn on 18 x 6.5 inches
+    "panel":  30,
+    "title":  26,
+    "axis":   22,
+    "tick":   20,
+    "legend": 20,
+}
+
+
+_RDGREY_BU = LinearSegmentedColormap.from_list(
+    "rdgrey_bu",
+    ["#67001F","#B2182B","#D6604D","#F4A582","#FDDBC7",
+     "#AAAAAA",
+     "#D1E5F0","#92C5DE","#4393C3","#2166AC","#053061"],
+    N=512,
+)
+_RDGREY_BU.set_bad(color="white")
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def log(msg):
+    print(f"[{pd.Timestamp.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+def smooth(s):
+    return s.rolling(SMOOTH_YEARS, center=True,
+                     min_periods=max(1, SMOOTH_YEARS // 2)).mean()
+
+def normalize_realm_codes(s):
+    x = s.astype(str).replace({r: MERGED_CODE for r in MERGE_TO})
+    return x.map(REALM_NAME).fillna(x)
+
+def period_for_scenario(sc):
+    return HIST_LAST if sc == "historical" else FUT_LAST
+
+def parquet_path(gcm, sc):
+    return GCMS_BASE / gcm / sc / "parquet" / f"wetGDE_area_{gcm}_{sc}.parquet"
+
+def timmean_path(sc):
+    y1, y2 = period_for_scenario(sc)
+    return ENSEMBLE / sc / "nc" / f"wetGDE_ensemble_timmean_{sc}_{y1}-{y2}.nc"
+
+def timmean_path_gcm(gcm, sc):
+    """Return the unique per-GCM period-mean NetCDF path.
+
+    The exact pixel-level uncertainty calculations require one historical and
+    one scenario period-mean file for every GCM. Ambiguous or missing files are
+    treated as errors; no realm-level or hard-coded fallback is used.
+    """
+    y1, y2 = period_for_scenario(sc)
+    nc_dir = GCMS_BASE / gcm / sc / "nc"
+    preferred = nc_dir / f"wetGDE_{gcm}_timmean_{sc}_{y1}-{y2}.nc"
+    if preferred.exists():
+        return preferred
+    patterns = [
+        f"*{gcm}*timmean*{sc}*{y1}-{y2}*.nc",
+        f"*timmean*{sc}*{y1}-{y2}*.nc",
+        f"*{y1}-{y2}*timmean*.nc",
+    ]
+    matches = []
+    for pattern in patterns:
+        matches.extend(nc_dir.glob(pattern))
+    matches = sorted(set(matches))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(
+            f"No per-GCM timmean file for {gcm}/{sc} ({y1}-{y2}) in {nc_dir}. "
+            "Generate the files before plotting uncertainty."
+        )
+    raise RuntimeError(
+        f"Ambiguous per-GCM timmean files for {gcm}/{sc}: "
+        + ", ".join(str(p) for p in matches)
+    )
+
+def monthly_clim_path(sc):
+    y1, y2 = period_for_scenario(sc)
+    return ENSEMBLE / sc / "nc" / f"wetGDE_ensemble_monthly_climatology_{sc}_{y1}-{y2}.nc"
+
+def add_map_background(
+    ax,
+    white=False,
+    coastline_width=1.25,
+    coastline_color="0.35",
+):
+    ax.set_global()
+    ax.set_extent([-180, 180, -58, 90], crs=ccrs.PlateCarree())
+    ax.add_feature(
+        cfeature.LAND.with_scale("110m"),
+        facecolor="white" if white else "#f5f5f2",
+        edgecolor="none",
+        zorder=0,
+    )
+    ax.coastlines(
+        linewidth=coastline_width,
+        color=coastline_color,
+        zorder=4,
+    )
+    ax.axis("off")
+
+def discrete_cmap_norm(vcm):
+    vals   = sorted(vcm)
+    cmap   = ListedColormap([vcm[v] for v in vals])
+    bounds = [vals[0]-0.5] + [(vals[i]+vals[i+1])/2 for i in range(len(vals)-1)] + [vals[-1]+0.5]
+    return cmap, BoundaryNorm(bounds, cmap.N)
+
+def open_timmean_da(sc, var):
+    path = timmean_path(sc)
+    if not path.exists(): raise FileNotFoundError(path)
+    ds = xr.open_dataset(path, decode_times=True, mask_and_scale=True)
+    if var not in ds: raise KeyError(f"{var} missing in {path}")
+    da = ds[var]
+    return da.isel(time=0) if "time" in da.dims else da
+
+def open_timmean_da_gcm(gcm, sc, var):
+    """Open a required per-GCM period-mean field."""
+    path = timmean_path_gcm(gcm, sc)
+    ds = xr.open_dataset(path, decode_times=True, mask_and_scale=True)
+    if var not in ds:
+        ds.close()
+        raise KeyError(f"{var} missing in {path}")
+    da = ds[var]
+    if "time" in da.dims:
+        if da.sizes["time"] != 1:
+            ds.close()
+            raise ValueError(f"Expected one period-mean time step in {path}; found {da.sizes['time']}")
+        da = da.isel(time=0)
+    return da
+
+def open_monthly_clim_da(sc, var):
+    path = monthly_clim_path(sc)
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    ds = xr.open_dataset(
+        path,
+        decode_times=True,
+        mask_and_scale=True,
+    )
+
+    if var not in ds:
+        raise KeyError(f"{var} missing in {path}")
+
+    da = ds[var]
+
+    if "time" in da.dims and "month" not in da.dims:
+        da = da.assign_coords(month=da["time"].dt.month).swap_dims({"time": "month"})
+        da = da.drop_vars("time")
+
+    return da
+
+# =============================================================================
+# PARQUET LOADERS
+# =============================================================================
+
+def extract_realm(df):
+    d = df.copy()
+    if "BIOME_ID_REALM" in d.columns:
+        code = d["BIOME_ID_REALM"].astype(str).str.split("_", n=1).str[-1]
+        d["realm"] = normalize_realm_codes(code)
+    elif "realm" in d.columns:
+        d["realm"] = normalize_realm_codes(d["realm"].astype(str))
+    else:
+        raise KeyError("No BIOME_ID_REALM or realm column found")
+    return d[~d["realm"].isin(["AN","Antarctica","Antarctic"])].copy()
+
+# Area values must be in km² throughout this script.
+# Set WETGDE_AREA_SCALE only when the upstream parquet files use another unit
+# (for example, 0.01 converts hectares to km²). The script validates the
+# resulting global baseline and fails rather than silently applying a guessed
+# correction.
+AREA_SCALE = float(os.environ.get("WETGDE_AREA_SCALE", "1.0"))
+EXPECTED_BASELINE_RANGE_KM2 = (0.5e6, 10e6)
+
+def load_parquet_all(cols):
+    frames = []
+    for gcm in GCMS:
+        for sc in SCENARIOS:
+            p = parquet_path(gcm, sc)
+            if not p.exists(): log(f"[missing] {p}"); continue
+            df   = pd.read_parquet(p)
+            keep = [c for c in ["time","BIOME_ID_REALM","realm","member"]+cols if c in df.columns]
+            df   = df[keep].copy()
+            df["time"]     = pd.to_datetime(df["time"])
+            df["source"]   = gcm
+            df["scenario"] = sc
+            df = extract_realm(df)
+            if "member" not in df.columns: df["member"] = "member_0"
+            missing = [c for c in cols if c not in df.columns]
+            if missing: raise KeyError(f"Missing cols in {p}: {missing}")
+            area_cols_here = [c for c in cols if c.startswith("area_") and c in df.columns]
+            for c in area_cols_here:
+                df[c] = pd.to_numeric(df[c], errors="coerce") * AREA_SCALE
+            frames.append(df)
+    if not frames: raise FileNotFoundError("No parquet files loaded")
+    out = pd.concat(frames, ignore_index=True)
+    log(f"[load_parquet_all] Applied AREA_SCALE={AREA_SCALE:g} to area columns.")
+    return out
+
+def annual_realm_from_parquet(cols, keep_gcm=False):
+    df         = load_parquet_all(cols)
+    area_cols  = [c for c in cols if c.startswith("area_")]
+    frac_cols  = [c for c in cols if c.startswith("f_")]
+    value_cols = area_cols + frac_cols
+    mb = df.groupby(["source","scenario","realm","BIOME_ID_REALM","time"],
+                    as_index=False)[value_cols].mean()
+    parts = []
+    if area_cols: parts.append(mb.groupby(["source","scenario","realm","time"], as_index=False)[area_cols].sum())
+    if frac_cols: parts.append(mb.groupby(["source","scenario","realm","time"], as_index=False)[frac_cols].mean())
+    monthly = parts[0]
+    for p in parts[1:]: monthly = monthly.merge(p, on=["source","scenario","realm","time"], how="outer")
+    monthly["year"] = monthly["time"].dt.year
+    ag = monthly.groupby(["source","scenario","realm","year"], as_index=False)[value_cols].mean()
+    return ag if keep_gcm else ag.groupby(["scenario","realm","year"], as_index=False)[value_cols].mean()
+
+def annual_biome_realm_from_parquet(cols, keep_gcm=False):
+    df    = load_parquet_all(cols)
+    parts = df["BIOME_ID_REALM"].astype(str).str.split("_", n=1, expand=True)
+    df["biome_realm"] = parts[0] + "_" + parts[1].replace({r: MERGED_CODE for r in MERGE_TO})
+    mmm   = df.groupby(["source","scenario","biome_realm","time"], as_index=False)[cols].mean()
+    mmm["year"] = mmm["time"].dt.year
+    ag    = mmm.groupby(["source","scenario","biome_realm","year"], as_index=False)[cols].mean()
+    if keep_gcm:
+        return ag
+    return ag.groupby(["scenario","biome_realm","year"], as_index=False)[cols].mean()
+
+def validate_area_units():
+    """Fail early when parquet areas are not plausibly expressed in km²."""
+    df = annual_realm_from_parquet([COL_TOTAL], keep_gcm=True)
+    baseline = df[
+        (df["scenario"] == "historical")
+        & df["year"].between(*HIST_LAST)
+    ]
+    totals = (
+        baseline.groupby(["source", "year"], as_index=False)[COL_TOTAL].sum()
+        .groupby("source")[COL_TOTAL].mean()
+    )
+    if totals.empty:
+        raise RuntimeError("No historical baseline values were available for unit validation.")
+    lo, hi = EXPECTED_BASELINE_RANGE_KM2
+    bad = totals[(totals < lo) | (totals > hi)]
+    if not bad.empty:
+        raise ValueError(
+            "Area-unit validation failed. Mean global baseline GDW areas are "
+            f"{bad.to_dict()} km², outside [{lo:g}, {hi:g}] km². "
+            "Set WETGDE_AREA_SCALE explicitly (for example 0.01 for ha→km²) "
+            "or repair the upstream parquet generation."
+        )
+    log(f"[unit check] global historical baseline by GCM (km²): {totals.round(0).to_dict()}")
+
+
+# =============================================================================
+# SHAPEFILES
+# =============================================================================
+
+def load_biome_realm_gdf():
+    gdf = gpd.read_file(WWF_SHAPE).to_crs("EPSG:4326")
+    gdf = gdf[~gdf["REALM"].isin(["AN"])].copy()
+    gdf["realm_code"]  = gdf["REALM"].astype(str).replace({r: MERGED_CODE for r in MERGE_TO})
+    gdf["biome_realm"] = gdf["BIOME"].astype(int).astype(str) + "_" + gdf["realm_code"]
+    return gdf.dissolve(by="biome_realm", as_index=False, aggfunc="first")[["biome_realm","geometry"]]
+
+def load_biome_realm_gdf_checked(table):
+    gdf = load_biome_realm_gdf()
+    log(f"Missing in table: {sorted(set(gdf['biome_realm'])-set(table['biome_realm']))[:20]}")
+    log(f"Extra in table:   {sorted(set(table['biome_realm'])-set(gdf['biome_realm']))[:20]}")
+    return gdf
+
+# =============================================================================
+# BIOME-REALM TABLE
+# =============================================================================
+
+def compute_biome_realm_pcr_table():
+    log("Computing biome-realm PCR table")
+    gdf_area    = load_biome_realm_gdf()
+    gdf_area["biome_area_km2"] = gdf_area.to_crs("ESRI:54009").geometry.area / 1e6
+    gdf_lookup  = dict(zip(gdf_area["biome_realm"], gdf_area["biome_area_km2"]))
+    cols        = list(dict.fromkeys(list(PCR_COLS.values()) + [COL_TOTAL]))
+    df          = annual_biome_realm_from_parquet(cols)
+    records     = []
+    base_hist   = df[(df["scenario"]=="historical") & df["year"].between(*HIST_LAST)]
+    base_old    = df[(df["scenario"]=="historical") & df["year"].between(*HIST_BASE)]
+    for sc in SCENARIOS:
+        base_all = base_old  if sc == "historical" else base_hist
+        fut_all  = base_hist if sc == "historical" else df[(df["scenario"]==sc) & df["year"].between(*FUT_LAST)]
+        for label, col in PCR_COLS.items():
+            use_col = COL_TOTAL if col == COL_TOTAL else col
+            b = base_all.groupby("biome_realm", as_index=False)[use_col].mean().rename(columns={use_col:"base"})
+            f = fut_all.groupby( "biome_realm", as_index=False)[use_col].mean().rename(columns={use_col:"future"})
+            m = b.merge(f, on="biome_realm", how="outer")
+            m["abs_change_km2"] = m["future"] - m["base"]
+            ba = gdf_lookup.get(m["biome_realm"].iloc[0], np.nan)
+            m["pct_change"]            = np.where(ba > 0, m["abs_change_km2"]/ba*100, np.nan)
+            m["normalized_change_pct"] = np.where(m["base"] >= BASELINE_MIN,
+                                                   m["abs_change_km2"]/m["base"]*100, np.nan)
+            m["scenario"]  = sc
+            m["component"] = label
+            records.append(m)
+    out = pd.concat(records, ignore_index=True)
+    out.to_csv(OUT / "biome_realm_percent_change_gw_lu_both.csv", index=False)
+    return out
+
+def compute_biome_realm_pcr_table_per_gcm(component_col=COL_TOTAL):
+    """
+    Same normalized_change_pct computation as compute_biome_realm_pcr_table(),
+    but kept per GCM (source). Used for the Figure 4 hatch overlay (sign
+    agreement across GCMs) and for S8 (agreement-count map).
+    """
+    log(f"Computing per-GCM biome-realm table for {component_col}")
+    cols = [component_col]
+    df   = annual_biome_realm_from_parquet(cols, keep_gcm=True)
+    records = []
+    base_hist = df[(df["scenario"]=="historical") & df["year"].between(*HIST_LAST)]
+    base_old  = df[(df["scenario"]=="historical") & df["year"].between(*HIST_BASE)]
+    for sc in SCENARIOS:
+        base_all = base_old  if sc == "historical" else base_hist
+        fut_all  = base_hist if sc == "historical" else df[(df["scenario"]==sc) & df["year"].between(*FUT_LAST)]
+        b = base_all.groupby(["source","biome_realm"], as_index=False)[component_col].mean().rename(columns={component_col:"base"})
+        f = fut_all.groupby( ["source","biome_realm"], as_index=False)[component_col].mean().rename(columns={component_col:"future"})
+        m = b.merge(f, on=["source","biome_realm"], how="outer")
+        m["abs_change_km2"] = m["future"] - m["base"]
+        m["normalized_change_pct"] = np.where(
+            m["base"] >= BASELINE_MIN,
+            m["abs_change_km2"] / m["base"] * 100.0,
+            np.nan,
+        )
+        m["scenario"] = sc
+        records.append(m)
+    out = pd.concat(records, ignore_index=True)
+    return out
+
+def compute_agreement_table(per_gcm_table):
+    """
+    From compute_biome_realm_pcr_table_per_gcm() output: for each
+    biome_realm x scenario, count how many GCMs agree on the sign of
+    abs_change_km2, and the fraction that is the majority sign.
+
+    Uses an explicit loop rather than groupby().apply() with a
+    Series-returning function -- that pattern is version-sensitive in
+    pandas (silent warnings/behavior changes around 2.2+ regarding
+    grouping columns) and a failure there was silently swallowed by the
+    try/except in plot_figure4_biome_map, which is why hatching could
+    disappear without any visible error.
+    """
+    rows = []
+    for (br, sc), g in per_gcm_table.groupby(["biome_realm", "scenario"]):
+        vals = g["abs_change_km2"].dropna()
+        n_gcm = len(vals)
+        if n_gcm == 0:
+            rows.append({"biome_realm": br, "scenario": sc, "n_gcm": 0,
+                         "n_agree": np.nan, "agree_frac": np.nan, "majority_sign": np.nan})
+            continue
+        n_pos = int((vals > 0).sum())
+        n_neg = int((vals < 0).sum())
+        n_agree = max(n_pos, n_neg)
+        majority_sign = 1 if n_pos >= n_neg else -1
+        rows.append({
+            "biome_realm": br,
+            "scenario": sc,
+            "n_gcm": n_gcm,
+            "n_agree": n_agree,
+            "agree_frac": n_agree / n_gcm,
+            "majority_sign": majority_sign,
+        })
+    out = pd.DataFrame(rows)
+    log(f"[compute_agreement_table] built {len(out)} biome_realm x scenario rows "
+        f"(n_gcm distribution: {out['n_gcm'].value_counts().to_dict() if not out.empty else 'empty'})")
+    return out
+
+# =============================================================================
+# DRIVER PIXEL MAPS
+# =============================================================================
+
+def plot_pixel_driver_direction_all_scenarios():
+    log("Computing pixel driver direction")
+    all_counts = []
+    class_labels = {
+        1: "Groundwater driven loss",
+        2: "Groundwater driven gain",
+        3: "Land-use driven loss",
+        4: "Land-use driven gain",
+        5: "Mixed loss",
+        6: "Mixed gain",
+    }
+    for sc in FUTURE_S:
+        ht = open_timmean_da("historical", COL_TOTAL)
+        ft = open_timmean_da(sc,           COL_TOTAL)
+        hn = open_timmean_da("historical", COL_NONLU)
+        fn = open_timmean_da(sc,           COL_NONLU)
+        dgw   = np.abs(fn - hn)
+        dlu   = np.abs((ft-fn) - (ht-hn))
+        total = dgw + dlu
+        sign  = ft - ht
+        fs    = total.compute().values
+        thr   = float(np.nanpercentile(fs[np.isfinite(fs)], 50)) if np.isfinite(fs).any() else 0.0
+        v     = total >= thr
+        dom   = xr.full_like(total, np.nan, dtype="float32")
+        dom = dom.where(~(v & (dgw > dlu) & (sign < 0)), 1)
+        dom = dom.where(~(v & (dgw > dlu) & (sign > 0)), 2)
+        dom = dom.where(~(v & (dlu > dgw) & (sign < 0)), 3)
+        dom = dom.where(~(v & (dlu > dgw) & (sign > 0)), 4)
+        dom = dom.where(~(v & np.isclose(dgw, dlu) & (sign < 0)), 5)
+        dom = dom.where(~(v & np.isclose(dgw, dlu) & (sign > 0)), 6)
+        dom.name = "dominant_driver_with_direction"
+        dom.attrs["scenario"] = sc
+        dom.to_netcdf(OUT / f"{sc}_pixel_dominant_driver_with_direction.nc")
+
+        dom_np = dom.compute().values.astype("float32")
+        hist_area = ht.compute().values.astype("float32")
+        hist_area = np.where(np.isfinite(hist_area), hist_area, 0.0)
+
+        valid_mask  = np.isfinite(dom_np)
+        vp          = int(valid_mask.sum())
+        total_area  = float(np.nansum(hist_area[valid_mask]))
+
+        for cls, label in class_labels.items():
+            mask    = dom_np == cls
+            n       = int(np.nansum(mask))
+            area_km2 = float(np.nansum(hist_area[mask]))
+            all_counts.append({
+                "scenario":          sc,
+                "class":             cls,
+                "label":             label,
+                "n_pixels":          n,
+                "valid_pixels":      vp,
+                "fraction_pct":      n / vp * 100 if vp > 0 else np.nan,
+                "area_km2":          area_km2,
+                "total_area_km2":    total_area,
+                "area_fraction_pct": area_km2 / total_area * 100 if total_area > 0 else np.nan,
+            })
+
+    pd.DataFrame(all_counts).to_csv(
+        OUT / "pixel_driver_direction_counts_all_scenarios.csv", index=False)
+    log("Saved driver direction outputs")
+
+
+def compute_realm_gain_loss_net_per_gcm():
+    """
+    Realm-consistent gain/loss/net table for Figure 1b and Figure 5b.
+
+    This uses EXACTLY the same per-GCM realm-level net changes as Figure 3.
+
+    For each GCM x future scenario:
+      1. compute net change for each of the six realms:
+             delta_realm = future realm area - historical realm area
+      2. net gain = sum of positive realm net changes
+      3. net loss = absolute sum of negative realm net changes
+      4. global net change = net gain - net loss
+                           = sum of the six realm net changes
+
+    Values are in 10^3 km2.
+
+    Because Figure 1b, Figure 3 and Figure 5b all use the same realm table,
+    the global net change here is mathematically identical to the sum of
+    the six Figure 3 realm net changes for each GCM and scenario.
+    """
+    gcm_table, _ = compute_figure3_realm_gcm_data()
+
+    gcm_table = gcm_table[
+        gcm_table["scenario"].isin(FUTURE_S)
+        & gcm_table["realm"].isin(REALM_ORDER)
+    ].copy()
+
+    rows = []
+
+    for sc in FUTURE_S:
+        for gcm in GCMS:
+            sub = gcm_table[
+                (gcm_table["scenario"] == sc)
+                & (gcm_table["source"] == gcm)
+            ].copy()
+
+            # Ensure exactly the six manuscript realms are represented.
+            present_realms = set(sub["realm"].dropna())
+            missing_realms = set(REALM_ORDER) - present_realms
+            if missing_realms:
+                raise RuntimeError(
+                    f"Missing realm(s) for {sc}, {gcm}: "
+                    + ", ".join(sorted(missing_realms))
+                )
+
+            delta = (
+                sub.set_index("realm")
+                .loc[REALM_ORDER, "delta_total"]
+                .astype(float)
+            )
+
+            if delta.isna().any():
+                bad = delta[delta.isna()].index.tolist()
+                raise RuntimeError(
+                    f"NaN realm net change for {sc}, {gcm}: {bad}"
+                )
+
+            net_gain = float(delta[delta > 0].sum())
+            net_loss = float(-delta[delta < 0].sum())
+            net_change = float(delta.sum())
+
+            reconstructed = net_gain - net_loss
+
+            if not np.isclose(
+                reconstructed,
+                net_change,
+                rtol=1e-10,
+                atol=1e-10,
+            ):
+                raise RuntimeError(
+                    f"Realm gain/loss/net identity failed for {sc}, {gcm}: "
+                    f"gain-loss={reconstructed}, sum_realms={net_change}"
+                )
+
+            rows.append(
+                {
+                    "scenario": sc,
+                    "GCM": gcm,
+                    "gain_1e3km2": net_gain,
+                    "loss_1e3km2": net_loss,
+                    "net_change_1e3km2": net_change,
+                    "sum_six_realms_1e3km2": net_change,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        raise RuntimeError(
+            "No realm-based gain/loss/net values were generated."
+        )
+
+    counts = out.groupby("scenario")["GCM"].nunique().to_dict()
+    expected = len(GCMS)
+    bad = {
+        sc: counts.get(sc, 0)
+        for sc in FUTURE_S
+        if counts.get(sc, 0) != expected
+    }
+    if bad:
+        raise RuntimeError(
+            f"Realm-based Figure 1b requires {expected} GCMs per scenario; "
+            f"found {bad}"
+        )
+
+    out.to_csv(
+        OUT / "figure1b_realm_consistent_per_gcm.csv",
+        index=False,
+    )
+
+    summary = (
+        out.groupby("scenario", as_index=False)
+        .agg(
+            gain_mean=("gain_1e3km2", "mean"),
+            gain_min=("gain_1e3km2", "min"),
+            gain_max=("gain_1e3km2", "max"),
+            loss_mean=("loss_1e3km2", "mean"),
+            loss_min=("loss_1e3km2", "min"),
+            loss_max=("loss_1e3km2", "max"),
+            net_mean=("net_change_1e3km2", "mean"),
+            net_min=("net_change_1e3km2", "min"),
+            net_max=("net_change_1e3km2", "max"),
+        )
+    )
+    summary.to_csv(
+        OUT / "figure1b_realm_consistent_summary.csv",
+        index=False,
+    )
+
+    log("[realm-consistent global summary]")
+    for _, r in summary.iterrows():
+        log(
+            f"  {SCEN_LABEL.get(r['scenario'], r['scenario'])}: "
+            f"gain={r['gain_mean']:.3f} "
+            f"[{r['gain_min']:.3f}, {r['gain_max']:.3f}], "
+            f"loss={r['loss_mean']:.3f} "
+            f"[{r['loss_min']:.3f}, {r['loss_max']:.3f}], "
+            f"net={r['net_mean']:.3f} "
+            f"[{r['net_min']:.3f}, {r['net_max']:.3f}]"
+        )
+
+    return out
+
+
+def compute_panel_b_gain_loss():
+    """
+    Compatibility wrapper for Figure 1b.
+
+    Figure 1b now uses the same six-realm per-GCM net-change calculation
+    as Figure 3. Positive realm net changes are summed as gain, negative
+    realm net changes are summed in absolute value as loss, and global
+    net change is gain - loss.
+    """
+    return compute_realm_gain_loss_net_per_gcm()
+
+
+def compute_panel_d_driver_breakdown_per_gcm():
+    """
+    Per-GCM approximation of the driver-class breakdown behind Figure 1d
+    (Groundwater/Landuse loss/gain, as % of GDW area).
+
+    IMPORTANT CAVEAT: Figure 1d itself is computed from PIXEL-level data
+    (dgw and dlu computed per pixel, then classified and area-weighted --
+    see plot_pixel_driver_direction_all_scenarios). An exact per-GCM
+    version of that requires per-GCM pixel timmean files, which do not
+    exist yet (see open_timmean_da_gcm / generate_gcm_timmean.py).
+
+    This function instead approximates the same classification at the
+    REALM level (6 realms) using the per-GCM parquet data already
+    available: for each GCM x scenario x realm, it computes the
+    groundwater-driven delta (change in GDW-without-landuse-impact) and
+    the landuse-driven delta (residual of total change minus the
+    groundwater-driven delta), classifies each realm as groundwater- or
+    landuse-dominant based on which delta is larger in magnitude, and
+    area-weights by each realm's historical GDW baseline.
+
+    This is a coarser approximation than the main figure (6 realms vs.
+    thousands of pixels, and no "mixed" category since realm-level ties
+    are rare) -- treat it as an indicative per-GCM table, not a like-for-
+    like replacement for Fig 1d's pixel-based percentages. Once per-GCM
+    pixel timmean files exist, replace this with a per-GCM version of
+    plot_pixel_driver_direction_all_scenarios() for an exact match.
+    """
+    df = annual_realm_from_parquet([COL_TOTAL, COL_NONLU], keep_gcm=True)
+    base_hist = df[(df["scenario"]=="historical") & df["year"].between(*HIST_LAST)]
+
+    rows = []
+    for sc in FUTURE_S:
+        fut = df[(df["scenario"]==sc) & df["year"].between(*FUT_LAST)]
+        for gcm in GCMS:
+            b = base_hist[base_hist["source"]==gcm].groupby("realm")[[COL_TOTAL, COL_NONLU]].mean()
+            f = fut[fut["source"]==gcm].groupby("realm")[[COL_TOTAL, COL_NONLU]].mean()
+            m = b.join(f, lsuffix="_b", rsuffix="_f", how="outer").dropna()
+            if m.empty:
+                continue
+
+            d_total = m[f"{COL_TOTAL}_f"] - m[f"{COL_TOTAL}_b"]
+            d_gw    = m[f"{COL_NONLU}_f"] - m[f"{COL_NONLU}_b"]   # groundwater-driven component
+            d_lu    = d_total - d_gw                               # landuse-driven residual
+
+            baseline_area = m[f"{COL_TOTAL}_b"]
+            total_baseline = float(baseline_area.sum())
+            if total_baseline <= 0:
+                continue
+
+            for realm in m.index:
+                dgw_r, dlu_r, sign_r = d_gw[realm], d_lu[realm], d_total[realm]
+                area_r = float(baseline_area[realm])
+                if abs(dgw_r) >= abs(dlu_r):
+                    driver = "Groundwater"
+                else:
+                    driver = "Landuse"
+                direction = "loss" if sign_r < 0 else "gain"
+                rows.append({
+                    "scenario": sc,
+                    "GCM": gcm,
+                    "realm": realm,
+                    "class": f"{driver} driven {direction}",
+                    "area_km2": area_r,
+                    "area_fraction_pct": area_r / total_baseline * 100,
+                })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    # Collapse to GCM x scenario x class (summing the realm area fractions
+    # that fall into each class), matching the shape of Fig 1d's classes.
+    summary = (
+        out.groupby(["scenario","GCM","class"], as_index=False)["area_fraction_pct"].sum()
+    )
+
+    # IMPORTANT: fill missing (scenario, GCM, class) combinations with 0
+    # rather than leaving them absent. Each realm is assigned to exactly
+    # one of the four classes per GCM, so the four class percentages must
+    # sum to ~100% for any single GCM. If a class never occurs for a GCM
+    # (e.g. no realm was landuse-driven-gain for that model), that
+    # combination is simply missing from `out` above -- and averaging
+    # only over the GCMs where a class DID occur silently inflates that
+    # class's mean relative to ones that occur in every GCM. This step
+    # makes the denominator consistent (all present GCMs) for every class.
+    all_classes = ["Groundwater driven loss", "Groundwater driven gain",
+                   "Land-use driven loss", "Land-use driven gain"]
+    present_pairs = summary[["scenario", "GCM"]].drop_duplicates()
+    grid = present_pairs.assign(_k=1).merge(
+        pd.DataFrame({"class": all_classes, "_k": 1}), on="_k"
+    ).drop(columns="_k")
+    summary_full = grid.merge(summary, on=["scenario", "GCM", "class"], how="left")
+    summary_full["area_fraction_pct"] = summary_full["area_fraction_pct"].fillna(0.0)
+
+    # Sanity check: per (scenario, GCM), the four classes should now sum
+    # to ~100%. Log if that's off by more than rounding error, since a
+    # violation here would indicate a different bug (e.g. realms dropped
+    # entirely rather than just one class missing).
+    check = summary_full.groupby(["scenario","GCM"])["area_fraction_pct"].sum()
+    bad = check[(check - 100).abs() > 0.5]
+    if not bad.empty:
+        log(f"[warn] compute_panel_d_driver_breakdown_per_gcm: {len(bad)} scenario/GCM "
+            f"combinations don't sum to ~100% after zero-filling: {bad.to_dict()}")
+
+    return summary_full
+
+
+def compute_pixel_driver_fractions_per_gcm():
+    """
+    Per-GCM version of the pixel driver classification in
+    plot_pixel_driver_direction_all_scenarios(), run once per GCM instead
+    of once on the ensemble mean. This is the exact match to what Figure
+    1d shows (same dgw/dlu/threshold/classification logic), unlike the
+    realm-level approximation used for S12/S9 -- so it can be used to add
+    error bars to Fig 1d that are anchored to the same numbers as the bars
+    themselves (the same fix already applied to panel b).
+
+    Requires per-GCM pixel timmean files via open_timmean_da_gcm(). If
+    those are missing for a GCM/scenario pair, that pair is skipped and
+    logged; if fewer than 2 GCMs have data for a scenario, that scenario
+    is dropped from the returned table (not enough to show a range).
+    """
+    class_labels = {
+        1: "Groundwater driven loss", 2: "Groundwater driven gain",
+        3: "Land-use driven loss",     4: "Land-use driven gain",
+        5: "Mixed loss",              6: "Mixed gain",
+    }
+    rows = []
+    for sc in FUTURE_S:
+        for gcm in GCMS:
+            ht = open_timmean_da_gcm(gcm, "historical", COL_TOTAL)
+            ft = open_timmean_da_gcm(gcm, sc,           COL_TOTAL)
+            hn = open_timmean_da_gcm(gcm, "historical", COL_NONLU)
+            fn = open_timmean_da_gcm(gcm, sc,           COL_NONLU)
+            if any(x is None for x in (ht, ft, hn, fn)):
+                continue
+
+            dgw   = np.abs(fn - hn)
+            dlu   = np.abs((ft-fn) - (ht-hn))
+            total = dgw + dlu
+            sign  = ft - ht
+            fs    = total.compute().values
+            thr   = float(np.nanpercentile(fs[np.isfinite(fs)], 50)) if np.isfinite(fs).any() else 0.0
+            v     = total >= thr
+            dom   = xr.full_like(total, np.nan, dtype="float32")
+            dom = dom.where(~(v & (dgw > dlu) & (sign < 0)), 1)
+            dom = dom.where(~(v & (dgw > dlu) & (sign > 0)), 2)
+            dom = dom.where(~(v & (dlu > dgw) & (sign < 0)), 3)
+            dom = dom.where(~(v & (dlu > dgw) & (sign > 0)), 4)
+            dom = dom.where(~(v & np.isclose(dgw, dlu) & (sign < 0)), 5)
+            dom = dom.where(~(v & np.isclose(dgw, dlu) & (sign > 0)), 6)
+
+            dom_np = dom.compute().values.astype("float32")
+            hist_area = ht.compute().values.astype("float32")
+            hist_area = np.where(np.isfinite(hist_area), hist_area, 0.0)
+
+            valid_mask = np.isfinite(dom_np)
+            total_area = float(np.nansum(hist_area[valid_mask]))
+            if total_area <= 0:
+                continue
+
+            for cls, label in class_labels.items():
+                mask = dom_np == cls
+                area_km2 = float(np.nansum(hist_area[mask]))
+                rows.append({
+                    "scenario": sc,
+                    "GCM": gcm,
+                    "class": label,
+                    "area_fraction_pct": area_km2 / total_area * 100,
+                })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        log("[warn] compute_pixel_driver_fractions_per_gcm: no per-GCM pixel timmean "
+            "files found. Run generate_gcm_timmean.py, or verify timmean_path_gcm() "
+            f"naming against the actual files under {GCMS_BASE}.")
+    else:
+        n_gcm_per_scenario = out.groupby("scenario")["GCM"].nunique().to_dict()
+        log(f"[compute_pixel_driver_fractions_per_gcm] GCMs found per scenario: {n_gcm_per_scenario}")
+    return out
+
+
+def compute_pixel_gain_loss_ensemble():
+    """
+    Exact pixel-based ensemble gain/loss totals for Figure 1b, computed
+    directly from the ensemble timmean fields (same source as panel a).
+    Sums all positive per-pixel changes as 'gain' and all negative changes
+    (absolute value) as 'loss', masked to BASELINE_MIN like panel a.
+    Always available (does not depend on per-GCM files), so this replaces
+    the old hardcoded loss_vals/gain_vals dict with an exact, reproducible
+    calculation instead.
+    """
+    rows = []
+    for sc in FUTURE_S:
+        ht = open_timmean_da("historical", COL_TOTAL)
+        ft = open_timmean_da(sc, COL_TOTAL)
+        diff = (ft - ht).where(ht >= BASELINE_MIN)
+        vals = diff.compute().values
+        vals = vals[np.isfinite(vals)]
+        gain = float(vals[vals > 0].sum()) / 1e3
+        loss = float(-vals[vals < 0].sum()) / 1e3
+        rows.append({"scenario": sc, "gain_1e3km2": gain, "loss_1e3km2": loss})
+    out = pd.DataFrame(rows)
+    log(f"[compute_pixel_gain_loss_ensemble] {out.to_dict('records')}")
+    return out
+
+
+
+def build_realm_id_grid(lat, lon):
+    """
+    Rasterize the six WWF biogeographic realms onto the NetCDF pixel grid.
+
+    The NetCDF coordinates are treated as nominally regular. Small floating-
+    point jitter in stored lat/lon values is allowed. Grid spacing is inferred
+    from the full coordinate extent rather than requiring every adjacent
+    difference to be numerically identical.
+
+    Realm IDs:
+      1 Nearctic
+      2 Neotropical
+      3 Afrotropical
+      4 Palearctic
+      5 Indo-Malayan
+      6 Australasian & Oceanian
+
+    0 means the pixel centre lies outside the six retained realm polygons.
+    """
+    lat = np.asarray(lat, dtype="float64")
+    lon = np.asarray(lon, dtype="float64")
+
+    if lat.ndim != 1 or lon.ndim != 1:
+        raise ValueError("Expected one-dimensional lat and lon coordinates.")
+    if len(lat) < 2 or len(lon) < 2:
+        raise ValueError("Need at least two lat/lon coordinates.")
+
+    # Require monotonic coordinates, but do NOT require machine-precision
+    # equality of every adjacent spacing.
+    dlon = np.diff(lon)
+    dlat = np.diff(lat)
+
+    lon_increasing = np.all(dlon > 0)
+    lon_decreasing = np.all(dlon < 0)
+    lat_increasing = np.all(dlat > 0)
+    lat_decreasing = np.all(dlat < 0)
+
+    if not (lon_increasing or lon_decreasing):
+        raise ValueError(
+            "Longitude coordinates are not monotonic; cannot construct a "
+            "single affine raster transform."
+        )
+    if not (lat_increasing or lat_decreasing):
+        raise ValueError(
+            "Latitude coordinates are not monotonic; cannot construct a "
+            "single affine raster transform."
+        )
+
+    # Infer nominal spacing from the endpoints. This is much more robust to
+    # float32/NetCDF coordinate jitter than comparing every adjacent diff.
+    dx = float((lon[-1] - lon[0]) / (len(lon) - 1))
+    dy = float((lat[-1] - lat[0]) / (len(lat) - 1))
+
+    # Compare actual coordinates with the ideal affine grid. Allow up to 5%
+    # of one pixel of coordinate jitter before treating the grid as genuinely
+    # irregular. Typical floating-point noise is many orders smaller.
+    lon_expected = lon[0] + np.arange(len(lon), dtype="float64") * dx
+    lat_expected = lat[0] + np.arange(len(lat), dtype="float64") * dy
+
+    lon_dev = float(np.nanmax(np.abs(lon - lon_expected)))
+    lat_dev = float(np.nanmax(np.abs(lat - lat_expected)))
+
+    lon_tol = abs(dx) * 0.05
+    lat_tol = abs(dy) * 0.05
+
+    log(
+        "[realm grid] "
+        f"dx={dx:.12g}, dy={dy:.12g}, "
+        f"max lon deviation={lon_dev:.3g}, "
+        f"max lat deviation={lat_dev:.3g}"
+    )
+
+    if lon_dev > lon_tol:
+        raise ValueError(
+            "Longitude grid is genuinely irregular for affine rasterization: "
+            f"max deviation={lon_dev:g}, tolerance={lon_tol:g}, "
+            f"nominal dx={dx:g}."
+        )
+    if lat_dev > lat_tol:
+        raise ValueError(
+            "Latitude grid is genuinely irregular for affine rasterization: "
+            f"max deviation={lat_dev:g}, tolerance={lat_tol:g}, "
+            f"nominal dy={dy:g}."
+        )
+
+    # Rasterio's affine transform maps array index -> pixel edge coordinates.
+    # Negative dx or dy is valid, so this works for either coordinate order.
+    transform = (
+        Affine.translation(
+            float(lon[0] - dx / 2.0),
+            float(lat[0] - dy / 2.0),
+        )
+        * Affine.scale(dx, dy)
+    )
+
+    gdf = gpd.read_file(WWF_SHAPE).to_crs("EPSG:4326")
+    gdf = gdf[~gdf["REALM"].isin(["AN"])].copy()
+
+    gdf["realm_code"] = (
+        gdf["REALM"].astype(str).replace({r: MERGED_CODE for r in MERGE_TO})
+    )
+    gdf["realm"] = gdf["realm_code"].map(REALM_NAME)
+    gdf = gdf[gdf["realm"].isin(REALM_ORDER)].copy()
+
+    # Dissolve biome polygons so rasterization is strictly by realm.
+    rgdf = gdf.dissolve(by="realm", as_index=False)[["realm", "geometry"]]
+
+    realm_to_id = {realm: i + 1 for i, realm in enumerate(REALM_ORDER)}
+    id_to_realm = {v: k for k, v in realm_to_id.items()}
+
+    shapes = [
+        (geom, realm_to_id[realm])
+        for realm, geom in zip(rgdf["realm"], rgdf["geometry"])
+        if geom is not None and not geom.is_empty
+    ]
+
+    realm_id = rasterize(
+        shapes=shapes,
+        out_shape=(len(lat), len(lon)),
+        fill=0,
+        transform=transform,
+        dtype="int16",
+        all_touched=False,
+    )
+
+    return realm_id, id_to_realm
+
+def compute_pixel_gain_loss_per_realm_and_check():
+    """
+    Pixel-level gross gain, gross loss and net change BY REALM, with an
+    explicit comparison to the global pixel calculation.
+
+    For each GCM x future scenario:
+      delta_pixel = future - historical
+
+    For every realm separately:
+      gross gain = sum(delta_pixel > 0)
+      gross loss = abs(sum(delta_pixel < 0))
+      net change = gross gain - gross loss
+
+    The same BASELINE_MIN mask used in Figure 1a/1b is applied first.
+
+    The six realm results are then summed and compared with the GLOBAL
+    pixel calculation performed on exactly the same delta field.
+
+    Two CSVs are written:
+      - figure1b_pixel_gain_loss_net_by_realm_per_gcm.csv
+      - figure1b_pixel_realm_vs_global_tally_per_gcm.csv
+
+    A third ensemble-summary CSV is also written.
+
+    Exact equality is expected only if the six WWF realm polygons cover
+    every globally included GDW pixel. The audit table reports both the
+    absolute and percentage differences so any coastline/island/outside-
+    realm pixels are immediately visible.
+    """
+    rows = []
+    audit_rows = []
+
+    # Build the realm grid once from the historical NetCDF coordinates.
+    ref = open_timmean_da_gcm(GCMS[0], "historical", COL_TOTAL)
+    realm_id, id_to_realm = build_realm_id_grid(
+        ref["lat"].values,
+        ref["lon"].values,
+    )
+
+    for sc in FUTURE_S:
+        for gcm in GCMS:
+            ht = open_timmean_da_gcm(gcm, "historical", COL_TOTAL)
+            ft = open_timmean_da_gcm(gcm, sc, COL_TOTAL)
+
+            diff = (ft - ht).where(ht >= BASELINE_MIN)
+            vals2d = diff.compute().values.astype("float64")
+            valid = np.isfinite(vals2d)
+
+            # GLOBAL pixel totals, using exactly the same valid pixels as
+            # Figure 1b.
+            global_vals = vals2d[valid].astype("float64", copy=False)
+            global_gain = float(
+                global_vals[global_vals > 0].sum(dtype=np.float64)
+            ) / 1e3
+            global_loss = float(
+                -global_vals[global_vals < 0].sum(dtype=np.float64)
+            ) / 1e3
+            global_net = global_gain - global_loss
+
+            # Track which valid global pixels are assigned to one of the
+            # six realm polygons.
+            realm_covered = valid & (realm_id > 0)
+
+            for rid, realm in id_to_realm.items():
+                mask = valid & (realm_id == rid)
+                rv = vals2d[mask]
+
+                if rv.size == 0:
+                    gain = loss = net = 0.0
+                else:
+                    rv = rv.astype("float64", copy=False)
+                    gain = float(
+                        rv[rv > 0].sum(dtype=np.float64)
+                    ) / 1e3
+                    loss = float(
+                        -rv[rv < 0].sum(dtype=np.float64)
+                    ) / 1e3
+                    net = gain - loss
+
+                direct_net = (
+                    float(rv.sum(dtype=np.float64)) / 1e3
+                    if rv.size else 0.0
+                )
+
+                if not np.isclose(
+                    net,
+                    direct_net,
+                    rtol=1e-6,
+                    atol=1e-4,
+                ):
+                    raise RuntimeError(
+                        f"Realm pixel identity failed for {sc}, {gcm}, {realm}: "
+                        f"gain-loss={net}, direct={direct_net}"
+                    )
+
+                rows.append(
+                    {
+                        "scenario": sc,
+                        "GCM": gcm,
+                        "realm": realm,
+                        "gross_gain_1e3km2": gain,
+                        "gross_loss_1e3km2": loss,
+                        "net_change_1e3km2": net,
+                        "n_valid_pixels": int(mask.sum()),
+                    }
+                )
+
+            # Sum the realm calculations.
+            current = [
+                r for r in rows
+                if r["scenario"] == sc and r["GCM"] == gcm
+            ]
+            realm_gain = sum(r["gross_gain_1e3km2"] for r in current)
+            realm_loss = sum(r["gross_loss_1e3km2"] for r in current)
+            realm_net = sum(r["net_change_1e3km2"] for r in current)
+
+            # Quantify valid global pixels that were not assigned to the
+            # six WWF realms. This explains any non-zero tally difference.
+            outside_vals = vals2d[valid & ~realm_covered]
+            outside_vals = outside_vals.astype("float64", copy=False)
+            outside_gain = (
+                float(
+                    outside_vals[outside_vals > 0].sum(dtype=np.float64)
+                ) / 1e3
+                if outside_vals.size else 0.0
+            )
+            outside_loss = (
+                float(
+                    -outside_vals[outside_vals < 0].sum(dtype=np.float64)
+                ) / 1e3
+                if outside_vals.size else 0.0
+            )
+            outside_net = outside_gain - outside_loss
+
+            # Numerical reconciliation check:
+            # global = six WWF realms + valid pixels outside those realm masks.
+            # Any failure here indicates a real accounting problem rather
+            # than mere spatial coverage differences.
+            recon_gain = realm_gain + outside_gain
+            recon_loss = realm_loss + outside_loss
+            recon_net = realm_net + outside_net
+
+            for label, lhs, rhs in (
+                ("gain", global_gain, recon_gain),
+                ("loss", global_loss, recon_loss),
+                ("net", global_net, recon_net),
+            ):
+                if not np.isclose(lhs, rhs, rtol=1e-6, atol=1e-4):
+                    raise RuntimeError(
+                        f"Realm/global pixel reconciliation failed for "
+                        f"{sc}, {gcm}, {label}: global={lhs}, "
+                        f"realms+outside={rhs}"
+                    )
+
+            audit_rows.append(
+                {
+                    "scenario": sc,
+                    "GCM": gcm,
+                    "global_gross_gain_1e3km2": global_gain,
+                    "sum_realms_gross_gain_1e3km2": realm_gain,
+                    "gain_difference_1e3km2": global_gain - realm_gain,
+                    "global_gross_loss_1e3km2": global_loss,
+                    "sum_realms_gross_loss_1e3km2": realm_loss,
+                    "loss_difference_1e3km2": global_loss - realm_loss,
+                    "global_net_change_1e3km2": global_net,
+                    "sum_realms_net_change_1e3km2": realm_net,
+                    "net_difference_1e3km2": global_net - realm_net,
+                    "outside_realms_gain_1e3km2": outside_gain,
+                    "outside_realms_loss_1e3km2": outside_loss,
+                    "outside_realms_net_1e3km2": outside_net,
+                    "reconstructed_global_gain_1e3km2": recon_gain,
+                    "reconstructed_global_loss_1e3km2": recon_loss,
+                    "reconstructed_global_net_1e3km2": recon_net,
+                    "global_valid_pixels": int(valid.sum()),
+                    "realm_covered_valid_pixels": int(realm_covered.sum()),
+                    "outside_realms_valid_pixels": int((valid & ~realm_covered).sum()),
+                    "realm_coverage_pct": (
+                        float(realm_covered.sum()) / float(valid.sum()) * 100.0
+                        if valid.sum() else np.nan
+                    ),
+                }
+            )
+
+    realm_df = pd.DataFrame(rows)
+    audit_df = pd.DataFrame(audit_rows)
+
+    realm_df.to_csv(
+        OUT / "figure1b_pixel_gain_loss_net_by_realm_per_gcm.csv",
+        index=False,
+    )
+    audit_df.to_csv(
+        OUT / "figure1b_pixel_realm_vs_global_tally_per_gcm.csv",
+        index=False,
+    )
+
+    # Five-GCM realm means and min-max spread, useful for Figure 3 or a
+    # supplementary table.
+    realm_summary = (
+        realm_df.groupby(["scenario", "realm"], as_index=False)
+        .agg(
+            gross_gain_mean=("gross_gain_1e3km2", "mean"),
+            gross_gain_min=("gross_gain_1e3km2", "min"),
+            gross_gain_max=("gross_gain_1e3km2", "max"),
+            gross_loss_mean=("gross_loss_1e3km2", "mean"),
+            gross_loss_min=("gross_loss_1e3km2", "min"),
+            gross_loss_max=("gross_loss_1e3km2", "max"),
+            net_change_mean=("net_change_1e3km2", "mean"),
+            net_change_min=("net_change_1e3km2", "min"),
+            net_change_max=("net_change_1e3km2", "max"),
+        )
+    )
+    realm_summary.to_csv(
+        OUT / "figure1b_pixel_gain_loss_net_by_realm_gcm_summary.csv",
+        index=False,
+    )
+
+    ensemble_audit = (
+        audit_df.groupby("scenario", as_index=False)
+        .agg(
+            global_gross_gain_mean=("global_gross_gain_1e3km2", "mean"),
+            sum_realms_gross_gain_mean=("sum_realms_gross_gain_1e3km2", "mean"),
+            gain_difference_mean=("gain_difference_1e3km2", "mean"),
+            global_gross_loss_mean=("global_gross_loss_1e3km2", "mean"),
+            sum_realms_gross_loss_mean=("sum_realms_gross_loss_1e3km2", "mean"),
+            loss_difference_mean=("loss_difference_1e3km2", "mean"),
+            global_net_change_mean=("global_net_change_1e3km2", "mean"),
+            sum_realms_net_change_mean=("sum_realms_net_change_1e3km2", "mean"),
+            net_difference_mean=("net_difference_1e3km2", "mean"),
+            realm_coverage_pct_mean=("realm_coverage_pct", "mean"),
+        )
+    )
+    ensemble_audit.to_csv(
+        OUT / "figure1b_pixel_realm_vs_global_tally_ensemble.csv",
+        index=False,
+    )
+
+    log("[pixel realm/global check] ensemble comparison:")
+    for _, r in ensemble_audit.iterrows():
+        log(
+            f"  {SCEN_LABEL.get(r['scenario'], r['scenario'])}: "
+            f"gain global={r['global_gross_gain_mean']:.3f}, "
+            f"realms={r['sum_realms_gross_gain_mean']:.3f}, "
+            f"diff={r['gain_difference_mean']:.3f}; "
+            f"loss global={r['global_gross_loss_mean']:.3f}, "
+            f"realms={r['sum_realms_gross_loss_mean']:.3f}, "
+            f"diff={r['loss_difference_mean']:.3f}; "
+            f"net global={r['global_net_change_mean']:.3f}, "
+            f"realms={r['sum_realms_net_change_mean']:.3f}, "
+            f"diff={r['net_difference_mean']:.3f}; "
+            f"coverage={r['realm_coverage_pct_mean']:.2f}%"
+        )
+
+    return realm_df, realm_summary, audit_df, ensemble_audit
+
+
+def compute_pixel_gain_loss_per_gcm():
+    """
+    Compute PIXEL-LEVEL gross gain, gross loss, and resulting net change
+    separately for each GCM and future scenario.
+
+    For every grid cell:
+        delta_pixel = future_GDW_area - historical_GDW_area
+
+    Then, for each GCM x scenario:
+        gross_gain = sum(delta_pixel where delta_pixel > 0)
+        gross_loss = abs(sum(delta_pixel where delta_pixel < 0))
+        net_change = gross_gain - gross_loss
+
+    The historical baseline mask is identical to Figure 1a:
+        historical GDW area >= BASELINE_MIN
+
+    Values are returned in 10^3 km2.
+
+    This guarantees, for every GCM and scenario:
+        net_change_1e3km2
+        == gain_1e3km2 - loss_1e3km2
+        == sum of all signed pixel changes / 1000
+    """
+    rows = []
+
+    for sc in FUTURE_S:
+        for gcm in GCMS:
+            ht = open_timmean_da_gcm(
+                gcm, "historical", COL_TOTAL
+            )
+            ft = open_timmean_da_gcm(
+                gcm, sc, COL_TOTAL
+            )
+
+            diff = (ft - ht).where(ht >= BASELINE_MIN)
+
+            # Convert to float64 before any summation. Summing very large
+            # rasters in float32 can introduce tiny order-dependent rounding
+            # differences between:
+            #   (sum positive) - (absolute sum negative)
+            # and
+            #   sum(all signed pixels)
+            vals = diff.compute().values.astype("float64")
+            vals = vals[np.isfinite(vals)]
+
+            if vals.size == 0:
+                continue
+
+            gross_gain = float(
+                vals[vals > 0].sum(dtype=np.float64)
+            ) / 1e3
+            gross_loss = float(
+                -vals[vals < 0].sum(dtype=np.float64)
+            ) / 1e3
+            net_change = gross_gain - gross_loss
+
+            # Independent signed-pixel sum for a numerical identity check.
+            direct_net = float(
+                vals.sum(dtype=np.float64)
+            ) / 1e3
+
+            # Allow only tiny floating-point differences. In 10^3 km² units,
+            # atol=1e-4 corresponds to 0.1 km².
+            if not np.isclose(
+                net_change,
+                direct_net,
+                rtol=1e-6,
+                atol=1e-4,
+            ):
+                raise RuntimeError(
+                    "Pixel gain/loss/net identity failed for "
+                    f"{sc}, {gcm}: "
+                    f"gain-loss={net_change}, "
+                    f"direct pixel sum={direct_net}"
+                )
+
+            rows.append(
+                {
+                    "scenario": sc,
+                    "GCM": gcm,
+                    "gain_1e3km2": gross_gain,
+                    "loss_1e3km2": gross_loss,
+                    "net_change_1e3km2": net_change,
+                    "direct_pixel_net_1e3km2": direct_net,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        log(
+            "[warn] compute_pixel_gain_loss_per_gcm: "
+            "no per-GCM pixel timmean files found."
+        )
+        return out
+
+    n_gcm_per_scenario = (
+        out.groupby("scenario")["GCM"].nunique().to_dict()
+    )
+    log(
+        "[compute_pixel_gain_loss_per_gcm] "
+        f"GCMs found per scenario: {n_gcm_per_scenario}"
+    )
+
+    # Save the exact per-GCM pixel calculation for manuscript checking.
+    out.to_csv(
+        OUT / "figure1b_pixel_gross_gain_loss_net_per_gcm.csv",
+        index=False,
+    )
+
+    return out
+
+
+def plot_figure1_four_panel():
+    """Build Figure 1 with five-GCM uncertainty and visible value labels.
+
+    Typography: uses FS1 on a 17.5 x 12.25 inch canvas rather than the former
+    30 x 21, keeping the same aspect ratio, so labels print about 2.3 times
+    larger at a given column width. Three consequences of the larger type are
+    handled explicitly:
+
+      * Panel b value labels no longer fit inside the bars, so they are drawn
+        just beyond the outer whisker in the bar's own colour.
+      * Panel b's legend is moved above the axes, where it cannot overlap
+        those labels.
+      * Panel d's label offsets and x-limits are fractions of the plotted
+        range rather than fixed constants, so they scale with the font.
+
+    Panel b:
+      - uses the same six realm-level per-GCM net changes as Figure 3,
+      - positive realm net changes are summed as gain,
+      - negative realm net changes are summed in absolute value as loss,
+      - global net change is gain minus loss,
+      - bars show five-GCM means and whiskers five-GCM min-max ranges.
+
+    Panel d:
+      - bar heights are five-GCM mean driver fractions,
+      - whiskers are five-GCM min-max ranges,
+      - percentages are written just beyond the outer whiskers.
+    """
+    log("Building Figure 1")
+
+    SCEN_ORDER = ["ssp126", "ssp370", "ssp585"]
+    SCEN_LABELS = {s: SCEN_LABEL[s] for s in SCEN_ORDER}
+
+    hist_da = open_timmean_da("historical", PIXEL_VAR)
+    lat = hist_da["lat"].values
+    lon = hist_da["lon"].values
+
+    diff_np = (
+        (open_timmean_da("ssp370", PIXEL_VAR) - hist_da)
+        .where(hist_da >= BASELINE_MIN)
+        .compute()
+        .values.astype("float32")
+    )
+
+    # Figure 1b uses EXACTLY the same per-GCM realm net changes as Figure 3.
+    gcm_gl = compute_realm_gain_loss_net_per_gcm()
+    gcm_dr = compute_pixel_driver_fractions_per_gcm()
+
+    for name, frame in {
+        "gain/loss": gcm_gl,
+        "driver fractions": gcm_dr,
+    }.items():
+        counts = frame.groupby("scenario")["GCM"].nunique()
+        if any(counts.get(sc, 0) != len(GCMS) for sc in SCEN_ORDER):
+            raise RuntimeError(
+                f"Figure 1 {name} requires all five GCMs; "
+                f"found {counts.to_dict()}"
+            )
+
+    gl_summary = (
+        gcm_gl.groupby("scenario")
+        .agg(
+            gain_mean=("gain_1e3km2", "mean"),
+            gain_min=("gain_1e3km2", "min"),
+            gain_max=("gain_1e3km2", "max"),
+            loss_mean=("loss_1e3km2", "mean"),
+            loss_min=("loss_1e3km2", "min"),
+            loss_max=("loss_1e3km2", "max"),
+            net_mean=("net_change_1e3km2", "mean"),
+            net_min=("net_change_1e3km2", "min"),
+            net_max=("net_change_1e3km2", "max"),
+        )
+        .reset_index()
+    )
+
+    dr_summary = (
+        gcm_dr.groupby(["scenario", "class"])
+        .agg(
+            mean=("area_fraction_pct", "mean"),
+            min=("area_fraction_pct", "min"),
+            max=("area_fraction_pct", "max"),
+        )
+        .reset_index()
+    )
+
+    gcm_gl.to_csv(
+        OUT / "figure1b_per_gcm_realm_gain_loss_net.csv",
+        index=False,
+    )
+    gl_summary.to_csv(
+        OUT / "figure1b_realm_gain_loss_net_summary.csv",
+        index=False,
+    )
+    (
+        gl_summary[
+            [
+                "scenario",
+                "gain_mean", "gain_min", "gain_max",
+                "loss_mean", "loss_min", "loss_max",
+                "net_mean", "net_min", "net_max",
+            ]
+        ]
+        .to_csv(
+            OUT / "figure1b_realm_gain_loss_net_manuscript_summary.csv",
+            index=False,
+        )
+    )
+    (
+        gl_summary[["scenario", "net_mean", "net_min", "net_max"]]
+        .to_csv(
+            OUT / "figure1b_net_change_only_summary.csv",
+            index=False,
+        )
+    )
+    gcm_dr.to_csv(
+        OUT / "figure1d_per_gcm_driver_fractions.csv",
+        index=False,
+    )
+    dr_summary.to_csv(
+        OUT / "figure1d_gcm_summary.csv",
+        index=False,
+    )
+
+    driver_nc = OUT / "ssp370_pixel_dominant_driver_with_direction.nc"
+    if not driver_nc.exists():
+        plot_pixel_driver_direction_all_scenarios()
+
+    with xr.open_dataset(driver_nc) as ds:
+        dom_np = ds["dominant_driver_with_direction"].values.astype("float32")
+
+    # 17.5 x 12.25 keeps the former 30:21 aspect ratio exactly.
+    fig = plt.figure(figsize=(15, 10.5), dpi=300)
+
+    # top lowered to 0.90 to leave room for panel b's legend above its axes;
+    # bottom raised to 0.16 and hspace widened for the larger shared legend.
+    gs = GridSpec(
+        2,
+        2,
+        figure=fig,
+        width_ratios=[2.1, 1.0],
+        left=0.05,
+        right=0.97,
+        bottom=0.16,
+        top=0.90,
+        wspace=0.24,
+        hspace=0.34,
+    )
+
+    ax_a = fig.add_subplot(gs[0, 0], projection=ccrs.Robinson())
+    ax_b = fig.add_subplot(gs[0, 1])
+    ax_c = fig.add_subplot(gs[1, 0], projection=ccrs.Robinson())
+    ax_d = fig.add_subplot(gs[1, 1])
+
+    panel_kw = dict(
+        fontsize=FS1["panel"],
+        fontweight="bold",
+        va="top",
+        ha="left",
+    )
+
+    # ------------------------------------------------------------------
+    # Panel a: SSP3-7.0 pixel change map
+    # ------------------------------------------------------------------
+    add_map_background(ax_a, white=True)
+
+    pm = ax_a.pcolormesh(
+        lon,
+        lat,
+        np.ma.masked_invalid(diff_np),
+        transform=ccrs.PlateCarree(),
+        cmap=_RDGREY_BU,
+        norm=TwoSlopeNorm(vcenter=0, vmin=-8, vmax=8),
+        shading="auto",
+        rasterized=True,
+        zorder=2,
+    )
+
+    # 1.2 rather than 1.5: the canvas is smaller, so the former weight would
+    # read heavier relative to the map.
+    ax_a.coastlines(linewidth=1.2, color="0.25", zorder=5)
+    ax_a.text(-0.04, 1.03, "(a)", transform=ax_a.transAxes, **panel_kw)
+
+    cb = fig.colorbar(
+        pm,
+        ax=ax_a,
+        orientation="horizontal",
+        pad=0.03,
+        fraction=0.052,
+        ticks=[-8, -4, 0, 4, 8],
+        extend="both",
+    )
+    cb.set_label("Change in GDW area (km\u00b2)", fontsize=FS1["axis"])
+    cb.ax.tick_params(labelsize=FS1["tick"])
+
+    # ------------------------------------------------------------------
+    # Panel b: REALM-CONSISTENT gain/loss
+    # ------------------------------------------------------------------
+    x = np.arange(len(SCEN_ORDER))
+    width = 0.30
+    summary_b = gl_summary.set_index("scenario").loc[SCEN_ORDER]
+
+    ax_b.bar(
+        x - width / 2,
+        -summary_b["loss_mean"].to_numpy(),
+        width,
+        color="#B2182B",
+        label="Gross loss",
+        zorder=3,
+    )
+    ax_b.bar(
+        x + width / 2,
+        summary_b["gain_mean"].to_numpy(),
+        width,
+        color="#2166AC",
+        label="Gross gain",
+        zorder=3,
+    )
+
+    for i, sc in enumerate(SCEN_ORDER):
+        row = summary_b.loc[sc]
+
+        # Loss magnitudes are stored positive but plotted below zero, so the
+        # plotted whisker limits are -loss_max to -loss_min.
+        ax_b.errorbar(
+            x[i] - width / 2,
+            -row.loss_mean,
+            yerr=[
+                [row.loss_max - row.loss_mean],
+                [row.loss_mean - row.loss_min],
+            ],
+            fmt="none",
+            ecolor="black",
+            capsize=7,
+            capthick=2.2,
+            elinewidth=2.2,
+            zorder=5,
+        )
+        ax_b.errorbar(
+            x[i] + width / 2,
+            row.gain_mean,
+            yerr=[
+                [row.gain_mean - row.gain_min],
+                [row.gain_max - row.gain_mean],
+            ],
+            fmt="none",
+            ecolor="black",
+            capsize=7,
+            capthick=2.2,
+            elinewidth=2.2,
+            zorder=5,
+        )
+
+        # Placed outside the whisker in the bar colour. At 20 pt these labels
+        # no longer fit within a 0.30-wide bar; white-on-fill would be
+        # clipped rather than merely tight.
+        ax_b.annotate(
+            f"\u2212{row.loss_mean:,.0f}",
+            xy=(x[i] - width / 2, -row.loss_max),
+            xytext=(0, -8),
+            textcoords="offset points",
+            ha="center",
+            va="top",
+            fontsize=FS1["value"],
+            color="#B2182B",
+            fontweight="bold",
+            zorder=6,
+        )
+        ax_b.annotate(
+            f"{row.gain_mean:,.0f}",
+            xy=(x[i] + width / 2, row.gain_max),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=FS1["value"],
+            color="#2166AC",
+            fontweight="bold",
+            zorder=6,
+        )
+
+    bmax = float(
+        max(
+            summary_b["gain_max"].max(),
+            summary_b["loss_max"].max(),
+            abs(summary_b["net_min"].min()),
+            abs(summary_b["net_max"].max()),
+            1.0,
+        )
+    )
+
+    # 1.30 rather than 1.15: head-room for the labels now outside the bars.
+    ax_b.set_ylim(-bmax * 1.30, bmax * 1.30)
+    ax_b.axhline(0, color="0.3", lw=1.2, zorder=2)
+    ax_b.set_xticks(x, [SCEN_LABELS[s] for s in SCEN_ORDER])
+    ax_b.set_ylabel("Area change (10\u00b3 km\u00b2)", fontsize=FS1["axis"])
+    ax_b.tick_params(labelsize=FS1["tick"])
+    ax_b.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=6))
+    ax_b.grid(axis="y", alpha=0.2, zorder=0)
+
+    leg_b = ax_b.legend(
+        frameon=False,
+        fontsize=FS1["legend"],
+        title="Five-GCM mean and min\u2013max",
+        loc="lower left",
+        bbox_to_anchor=(0, 1.01, 1, 0.2),
+        mode="expand",
+        ncol=2,
+        columnspacing=2.0,
+        handletextpad=0.5,
+        borderaxespad=0,
+    )
+    leg_b.get_title().set_fontsize(FS1["small"])
+
+    ax_b.text(-0.18, 1.30, "(b)", transform=ax_b.transAxes, **panel_kw)
+
+    # ------------------------------------------------------------------
+    # Panel c: dominant driver map
+    # ------------------------------------------------------------------
+    class_colors = {
+        1: "#08306B",
+        2: "#6BAED6",
+        3: "#7F2704",
+        4: "#FDAE6B",
+        5: "#238B45",
+        6: "#A1D99B",
+    }
+
+    class_labels = {
+        1: "Groundwater-driven loss",
+        2: "Groundwater-driven gain",
+        3: "Land-use-driven loss",
+        4: "Land-use-driven gain",
+        5: "Mixed-driver loss",
+        6: "Mixed-driver gain",
+    }
+
+    cmap_c, norm_c = discrete_cmap_norm(class_colors)
+
+    add_map_background(ax_c, white=True)
+
+    ax_c.pcolormesh(
+        lon,
+        lat,
+        np.ma.masked_invalid(dom_np),
+        transform=ccrs.PlateCarree(),
+        cmap=cmap_c,
+        norm=norm_c,
+        shading="auto",
+        rasterized=True,
+        zorder=2,
+    )
+
+    ax_c.coastlines(linewidth=1.2, color="0.25", zorder=5)
+    ax_c.text(-0.04, 1.03, "(c)", transform=ax_c.transAxes, **panel_kw)
+
+    # ------------------------------------------------------------------
+    # Panel d: driver fractions
+    # ------------------------------------------------------------------
+    loss_classes = [
+        "Groundwater driven loss",
+        "Land-use driven loss",
+        "Mixed loss",
+    ]
+    gain_classes = [
+        "Groundwater driven gain",
+        "Land-use driven gain",
+        "Mixed gain",
+    ]
+
+    loss_cols = ["#08306B", "#7F2704", "#238B45"]
+    gain_cols = ["#6BAED6", "#FDAE6B", "#A1D99B"]
+
+    y = np.arange(len(SCEN_ORDER))
+    h = 0.16
+    offsets = np.array([-1, 0, 1]) * h
+
+    dsumm = dr_summary.set_index(["scenario", "class"])
+
+    # Fractions of the plotted range, not the former fixed +12 and 1.5, so
+    # the padding tracks the font size.
+    data_max = float(dr_summary["max"].max())
+    max_range = data_max * 1.50
+    label_pad = data_max * 0.035
+    ax_d.set_xlim(-max_range, max_range)
+
+    for i, sc in enumerate(SCEN_ORDER):
+        for off, cls, col in zip(offsets, loss_classes, loss_cols):
+            r = dsumm.loc[(sc, cls)]
+
+            ax_d.barh(y[i] + off, -r["mean"], h, color=col, zorder=3)
+
+            ax_d.errorbar(
+                -r["mean"],
+                y[i] + off,
+                xerr=[
+                    [r["max"] - r["mean"]],
+                    [r["mean"] - r["min"]],
+                ],
+                fmt="none",
+                ecolor="black",
+                capsize=4,
+                capthick=1.8,
+                elinewidth=1.8,
+                zorder=5,
+            )
+
+            # Values below 1% are omitted.
+            if r["mean"] >= 1.0:
+                ax_d.text(
+                    -r["max"] - label_pad,
+                    y[i] + off,
+                    f"{r['mean']:.0f}%",
+                    ha="right",
+                    va="center",
+                    fontsize=FS1["small"],
+                    color="black",
+                    fontweight="bold",
+                    clip_on=False,
+                    zorder=6,
+                )
+
+        for off, cls, col in zip(offsets, gain_classes, gain_cols):
+            r = dsumm.loc[(sc, cls)]
+
+            ax_d.barh(y[i] + off, r["mean"], h, color=col, zorder=3)
+
+            ax_d.errorbar(
+                r["mean"],
+                y[i] + off,
+                xerr=[
+                    [r["mean"] - r["min"]],
+                    [r["max"] - r["mean"]],
+                ],
+                fmt="none",
+                ecolor="black",
+                capsize=4,
+                capthick=1.8,
+                elinewidth=1.8,
+                zorder=5,
+            )
+
+            if r["mean"] >= 1.0:
+                ax_d.text(
+                    r["max"] + label_pad,
+                    y[i] + off,
+                    f"{r['mean']:.0f}%",
+                    ha="left",
+                    va="center",
+                    fontsize=FS1["small"],
+                    color="black",
+                    fontweight="bold",
+                    clip_on=False,
+                    zorder=6,
+                )
+
+    ax_d.axvline(0, color="0.3", lw=1.2, zorder=2)
+    ax_d.set_yticks(y, [SCEN_LABELS[s] for s in SCEN_ORDER])
+
+    # Loss and Gain folded into the axis label. As separate annotations below
+    # the axes they collided with the enlarged x-label.
+    ax_d.set_xlabel(
+        "\u2190 Loss    Share of affected historical GDW area (%)    Gain \u2192",
+        fontsize=FS1["small"],
+        labelpad=10,
+    )
+    ax_d.xaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(
+            lambda value, _: f"{abs(value):.0f}"
+        )
+    )
+    ax_d.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=6))
+    ax_d.tick_params(labelsize=FS1["tick"])
+    ax_d.grid(axis="x", alpha=0.2, zorder=0)
+    ax_d.text(-0.18, 1.03, "(d)", transform=ax_d.transAxes, **panel_kw)
+
+    fig.legend(
+        [Patch(facecolor=class_colors[i]) for i in range(1, 7)],
+        [class_labels[i] for i in range(1, 7)],
+        ncol=3,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.015),
+        frameon=False,
+        fontsize=FS1["legend"],
+        columnspacing=2.4,
+        handletextpad=0.8,
+    )
+
+    # No bbox_inches="tight": the GridSpec margins above are chosen to hold
+    # the legends, and cropping would undo them.
+    for ext in ("png", "pdf", "svg"):
+        fig.savefig(OUT / f"figure1_four_panel.{ext}", dpi=300)
+
+    plt.close(fig)
+    log("Saved: figure1_four_panel.png")
+
+
+def plot_figure5_four_panel_net_only():
+    """Build Figure 1 with five-GCM uncertainty and visible value labels.
+
+    Panel b:
+      - shows only global net GDW-area change,
+      - net change is the sum of the same six realm net changes used in
+        Figure 3, calculated separately for every GCM,
+      - bar = five-GCM mean,
+      - whisker = minimum-to-maximum of the five GCM-specific net changes.
+
+    Panel d:
+      - bar heights are five-GCM mean driver fractions,
+      - whiskers are five-GCM min–max ranges,
+      - percentages are written just beyond the outer whiskers.
+    """
+    log("Building Figure 5 (Figure 1 layout, net-change-only panel b)")
+
+    SCEN_ORDER = ["ssp126", "ssp370", "ssp585"]
+    SCEN_LABELS = {s: SCEN_LABEL[s] for s in SCEN_ORDER}
+
+    hist_da = open_timmean_da("historical", PIXEL_VAR)
+    lat = hist_da["lat"].values
+    lon = hist_da["lon"].values
+
+    diff_np = (
+        (open_timmean_da("ssp370", PIXEL_VAR) - hist_da)
+        .where(hist_da >= BASELINE_MIN)
+        .compute()
+        .values.astype("float32")
+    )
+
+    # Figure 5b uses the same six-realm per-GCM net-change table as
+    # Figure 1b and Figure 3.
+    gcm_gl = compute_realm_gain_loss_net_per_gcm()
+
+    gcm_dr = compute_pixel_driver_fractions_per_gcm()
+
+    for name, frame in {
+        "gain/loss": gcm_gl,
+        "driver fractions": gcm_dr,
+    }.items():
+        counts = frame.groupby("scenario")["GCM"].nunique()
+        if any(counts.get(sc, 0) != len(GCMS) for sc in SCEN_ORDER):
+            raise RuntimeError(
+                f"Figure 1 {name} requires all five GCMs; "
+                f"found {counts.to_dict()}"
+            )
+
+    gl_summary = (
+        gcm_gl.groupby("scenario")
+        .agg(
+            gain_mean=("gain_1e3km2", "mean"),
+            gain_min=("gain_1e3km2", "min"),
+            gain_max=("gain_1e3km2", "max"),
+            loss_mean=("loss_1e3km2", "mean"),
+            loss_min=("loss_1e3km2", "min"),
+            loss_max=("loss_1e3km2", "max"),
+            net_mean=("net_change_1e3km2", "mean"),
+            net_min=("net_change_1e3km2", "min"),
+            net_max=("net_change_1e3km2", "max"),
+        )
+        .reset_index()
+    )
+
+    dr_summary = (
+        gcm_dr.groupby(["scenario", "class"])
+        .agg(
+            mean=("area_fraction_pct", "mean"),
+            min=("area_fraction_pct", "min"),
+            max=("area_fraction_pct", "max"),
+        )
+        .reset_index()
+    )
+
+    gcm_gl.to_csv(
+        OUT / "figure5b_source_realm_gain_loss_net_per_gcm.csv",
+        index=False,
+    )
+    gl_summary.to_csv(
+        OUT / "figure5b_source_realm_gain_loss_net_summary.csv",
+        index=False,
+    )
+
+    # Exact values behind Figure 5b.
+    figure5b_net = gcm_gl[
+        ["scenario", "GCM", "net_change_1e3km2"]
+    ].copy()
+    figure5b_net.to_csv(
+        OUT / "figure5b_net_change_per_gcm.csv",
+        index=False,
+    )
+    (
+        figure5b_net.groupby("scenario")
+        .agg(
+            net_mean=("net_change_1e3km2", "mean"),
+            net_min=("net_change_1e3km2", "min"),
+            net_max=("net_change_1e3km2", "max"),
+        )
+        .reset_index()
+        .to_csv(
+            OUT / "figure5b_net_change_gcm_summary.csv",
+            index=False,
+        )
+    )
+    gcm_dr.to_csv(
+        OUT / "figure1d_per_gcm_driver_fractions.csv",
+        index=False,
+    )
+    dr_summary.to_csv(
+        OUT / "figure1d_gcm_summary.csv",
+        index=False,
+    )
+
+    driver_nc = OUT / "ssp370_pixel_dominant_driver_with_direction.nc"
+    if not driver_nc.exists():
+        plot_pixel_driver_direction_all_scenarios()
+
+    with xr.open_dataset(driver_nc) as ds:
+        dom_np = ds["dominant_driver_with_direction"].values.astype("float32")
+
+    fig = plt.figure(figsize=(17.5, 12.25), dpi=300)
+
+    gs = GridSpec(
+        2,
+        2,
+        figure=fig,
+        width_ratios=[2.1, 1.0],
+        left=0.04,
+        right=0.98,
+        bottom=0.11,
+        top=0.97,
+        wspace=0.18,
+        hspace=0.20,
+    )
+
+    ax_a = fig.add_subplot(gs[0, 0], projection=ccrs.Robinson())
+    ax_b = fig.add_subplot(gs[0, 1])
+    ax_c = fig.add_subplot(gs[1, 0], projection=ccrs.Robinson())
+    ax_d = fig.add_subplot(gs[1, 1])
+
+    panel_kw = dict(
+        fontsize=FS["panel"],
+        fontweight="bold",
+        va="top",
+        ha="left",
+    )
+
+    # ------------------------------------------------------------------
+    # Panel a: SSP3-7.0 pixel change map
+    # ------------------------------------------------------------------
+    add_map_background(ax_a, white=True)
+
+    pm = ax_a.pcolormesh(
+        lon,
+        lat,
+        np.ma.masked_invalid(diff_np),
+        transform=ccrs.PlateCarree(),
+        cmap=_RDGREY_BU,
+        norm=TwoSlopeNorm(vcenter=0, vmin=-8, vmax=8),
+        shading="auto",
+        rasterized=True,
+        zorder=2,
+    )
+
+    ax_a.coastlines(
+        linewidth=1.5,
+        color="0.25",
+        zorder=5,
+    )
+
+    ax_a.text(
+        -0.04,
+        1.03,
+        "(a)",
+        transform=ax_a.transAxes,
+        **panel_kw,
+    )
+
+    cb = fig.colorbar(
+        pm,
+        ax=ax_a,
+        orientation="horizontal",
+        pad=0.03,
+        fraction=0.045,
+        ticks=[-8, -4, 0, 4, 8],
+        extend="both",
+    )
+
+    cb.set_label(
+        "Change in GDW area (km²)",
+        fontsize=FS["axis"],
+    )
+    cb.ax.tick_params(labelsize=FS["tick"])
+
+    # ------------------------------------------------------------------
+    # Panel b: GLOBAL NET CHANGE as bars with five-GCM min-max whiskers
+    # ------------------------------------------------------------------
+    x = np.arange(len(SCEN_ORDER))
+    summary_b = gl_summary.set_index("scenario").loc[SCEN_ORDER]
+
+    net_mean = summary_b["net_mean"].to_numpy()
+
+    # One bar per scenario. Negative net changes are red and positive
+    # net changes are blue, matching the loss/gain convention in Figure 1b.
+    bar_colors = [
+        "#B2182B" if v < 0 else "#2166AC"
+        for v in net_mean
+    ]
+
+    bars = ax_b.bar(
+        x,
+        net_mean,
+        width=0.48,
+        color=bar_colors,
+        zorder=3,
+    )
+
+    for i, sc in enumerate(SCEN_ORDER):
+        row = summary_b.loc[sc]
+
+        # The whisker is calculated from the five independently computed
+        # GCM-specific GLOBAL net changes, where each global value is the
+        # sum of the same six realm net changes plotted in Figure 3.
+        ax_b.errorbar(
+            x[i],
+            row.net_mean,
+            yerr=[
+                [row.net_mean - row.net_min],
+                [row.net_max - row.net_mean],
+            ],
+            fmt="none",
+            ecolor="black",
+            capsize=6,
+            capthick=1.8,
+            elinewidth=1.8,
+            zorder=5,
+        )
+
+        # Put the mean value inside the bar when there is enough space;
+        # otherwise place it just outside the bar.
+        value = float(row.net_mean)
+        sign = "−" if value < 0 else "+"
+        label = f"{sign}{abs(value):,.0f}"
+
+        if abs(value) >= 25:
+            ax_b.text(
+                x[i],
+                value * 0.55,
+                label,
+                ha="center",
+                va="center",
+                fontsize=FS["value"],
+                color="white",
+                fontweight="bold",
+                zorder=6,
+            )
+        else:
+            offset = 10 if value >= 0 else -10
+            va = "bottom" if value >= 0 else "top"
+            ax_b.annotate(
+                label,
+                xy=(x[i], value),
+                xytext=(0, offset),
+                textcoords="offset points",
+                ha="center",
+                va=va,
+                fontsize=FS["value"],
+                color="black",
+                fontweight="bold",
+                zorder=6,
+            )
+
+    net_abs_max = float(
+        max(
+            abs(summary_b["net_min"].min()),
+            abs(summary_b["net_max"].max()),
+            1.0,
+        )
+    )
+
+    ax_b.set_ylim(
+        -net_abs_max * 1.15,
+        net_abs_max * 1.15,
+    )
+
+    ax_b.axhline(
+        0,
+        color="0.3",
+        lw=1,
+        zorder=2,
+    )
+
+    ax_b.set_xticks(
+        x,
+        [SCEN_LABELS[s] for s in SCEN_ORDER],
+    )
+
+    ax_b.set_ylabel(
+        "Net area change (10³ km²)",
+        fontsize=FS["axis"],
+    )
+
+    ax_b.tick_params(labelsize=FS["tick"])
+    ax_b.grid(axis="y", alpha=0.2, zorder=0)
+
+    ax_b.legend(
+        handles=[
+            Patch(facecolor="#B2182B", label="Net loss"),
+            Patch(facecolor="#2166AC", label="Net gain"),
+        ],
+        frameon=False,
+        fontsize=FS["legend"],
+        title="Five-GCM mean and min–max",
+    )
+
+    ax_b.text(
+        -0.12,
+        1.03,
+        "(b)",
+        transform=ax_b.transAxes,
+        **panel_kw,
+    )
+
+    # ------------------------------------------------------------------
+    # Panel c: dominant driver map
+    # ------------------------------------------------------------------
+    class_colors = {
+        1: "#08306B",
+        2: "#6BAED6",
+        3: "#7F2704",
+        4: "#FDAE6B",
+        5: "#238B45",
+        6: "#A1D99B",
+    }
+
+    class_labels = {
+        1: "Groundwater-driven loss",
+        2: "Groundwater-driven gain",
+        3: "Land-use-driven loss",
+        4: "Land-use-driven gain",
+        5: "Mixed-driver loss",
+        6: "Mixed-driver gain",
+    }
+
+    cmap_c, norm_c = discrete_cmap_norm(class_colors)
+
+    add_map_background(ax_c, white=True)
+
+    ax_c.pcolormesh(
+        lon,
+        lat,
+        np.ma.masked_invalid(dom_np),
+        transform=ccrs.PlateCarree(),
+        cmap=cmap_c,
+        norm=norm_c,
+        shading="auto",
+        rasterized=True,
+        zorder=2,
+    )
+
+    ax_c.coastlines(
+        linewidth=1.5,
+        color="0.25",
+        zorder=5,
+    )
+
+    ax_c.text(
+        -0.04,
+        1.03,
+        "(c)",
+        transform=ax_c.transAxes,
+        **panel_kw,
+    )
+
+    # ------------------------------------------------------------------
+    # Panel d: driver fractions with percentage labels and min-max ranges
+    # ------------------------------------------------------------------
+    loss_classes = [
+        "Groundwater driven loss",
+        "Land-use driven loss",
+        "Mixed loss",
+    ]
+    gain_classes = [
+        "Groundwater driven gain",
+        "Land-use driven gain",
+        "Mixed gain",
+    ]
+
+    loss_cols = [
+        "#08306B",
+        "#7F2704",
+        "#238B45",
+    ]
+    gain_cols = [
+        "#6BAED6",
+        "#FDAE6B",
+        "#A1D99B",
+    ]
+
+    y = np.arange(len(SCEN_ORDER))
+    h = 0.16
+    offsets = np.array([-1, 0, 1]) * h
+
+    dsumm = dr_summary.set_index(["scenario", "class"])
+
+    max_range = float(dr_summary["max"].max()) + 12.0
+    ax_d.set_xlim(-max_range, max_range)
+
+    for i, sc in enumerate(SCEN_ORDER):
+        for off, cls, col in zip(
+            offsets,
+            loss_classes,
+            loss_cols,
+        ):
+            r = dsumm.loc[(sc, cls)]
+
+            ax_d.barh(
+                y[i] + off,
+                -r["mean"],
+                h,
+                color=col,
+                zorder=3,
+            )
+
+            ax_d.errorbar(
+                -r["mean"],
+                y[i] + off,
+                xerr=[
+                    [r["max"] - r["mean"]],
+                    [r["mean"] - r["min"]],
+                ],
+                fmt="none",
+                ecolor="black",
+                capsize=3,
+                capthick=1.4,
+                elinewidth=1.4,
+                zorder=5,
+            )
+
+            # Place the ensemble-mean percentage just beyond the outer
+            # min-max whisker. Values below 1% are omitted.
+            if r["mean"] >= 1.0:
+                ax_d.text(
+                    -r["max"] - 1.5,
+                    y[i] + off,
+                    f"{r['mean']:.0f}%",
+                    ha="right",
+                    va="center",
+                    fontsize=FS["small"],
+                    color="black",
+                    fontweight="bold",
+                    clip_on=False,
+                    zorder=6,
+                )
+
+        for off, cls, col in zip(
+            offsets,
+            gain_classes,
+            gain_cols,
+        ):
+            r = dsumm.loc[(sc, cls)]
+
+            ax_d.barh(
+                y[i] + off,
+                r["mean"],
+                h,
+                color=col,
+                zorder=3,
+            )
+
+            ax_d.errorbar(
+                r["mean"],
+                y[i] + off,
+                xerr=[
+                    [r["mean"] - r["min"]],
+                    [r["max"] - r["mean"]],
+                ],
+                fmt="none",
+                ecolor="black",
+                capsize=3,
+                capthick=1.4,
+                elinewidth=1.4,
+                zorder=5,
+            )
+
+            # Place the ensemble-mean percentage just beyond the outer
+            # min-max whisker. Values below 1% are omitted.
+            if r["mean"] >= 1.0:
+                ax_d.text(
+                    r["max"] + 1.5,
+                    y[i] + off,
+                    f"{r['mean']:.0f}%",
+                    ha="left",
+                    va="center",
+                    fontsize=FS["small"],
+                    color="black",
+                    fontweight="bold",
+                    clip_on=False,
+                    zorder=6,
+                )
+
+    ax_d.axvline(
+        0,
+        color="0.3",
+        lw=1,
+        zorder=2,
+    )
+    ax_d.set_yticks(
+        y,
+        [SCEN_LABELS[s] for s in SCEN_ORDER],
+    )
+    ax_d.set_xlabel(
+        "Share of affected historical GDW area (%)",
+        fontsize=FS["axis"],
+    )
+    ax_d.xaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(
+            lambda value, _: f"{abs(value):.0f}"
+        )
+    )
+    ax_d.tick_params(labelsize=FS["tick"])
+    ax_d.grid(axis="x", alpha=0.2, zorder=0)
+    ax_d.text(
+        0.25,
+        -0.10,
+        "← Loss",
+        transform=ax_d.transAxes,
+        ha="center",
+    )
+    ax_d.text(
+        0.75,
+        -0.10,
+        "Gain →",
+        transform=ax_d.transAxes,
+        ha="center",
+    )
+    ax_d.text(
+        -0.12,
+        1.03,
+        "(d)",
+        transform=ax_d.transAxes,
+        **panel_kw,
+    )
+
+    fig.legend(
+        [Patch(facecolor=class_colors[i]) for i in range(1, 7)],
+        [class_labels[i] for i in range(1, 7)],
+        ncol=6,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        frameon=False,
+        fontsize=FS["legend"],
+    )
+
+    fig.savefig(
+        OUT / "figure5_four_panel_net_change.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    fig.savefig(
+        OUT / "figure5_four_panel_net_change.pdf",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    fig.savefig(
+        OUT / "figure5_four_panel_net_change.svg",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+    log("Saved: figure5_four_panel_net_change.png")
+
+
+
+def plot_realm_ts_only():
+    """Figure 2: global and realm GDW-area trajectories in one figure.
+
+    Layout
+    ------
+    Row 1: empty, Global, empty
+    Row 2: Nearctic, Neotropical, Afrotropical
+    Row 3: Palearctic, Indo-Malayan, Australasian & Oceanian
+
+    Lines show the five-GCM ensemble mean and shading shows the full min-max
+    range. Historical and future segments are smoothed separately, as in the
+    original plotting method. Visual continuity is guaranteed by applying a
+    plotting-only offset after smoothing so the first future ensemble-mean
+    value equals the final smoothed historical value. The historical endpoint
+    is then explicitly prepended to each future line and uncertainty envelope.
+    """
+    log("Building Figure 2 with centred Global panel and six realm panels")
+
+    df = annual_realm_from_parquet([TS_VAR], keep_gcm=True)
+
+    global_df = (
+        df.groupby(
+            ["source", "scenario", "year"],
+            as_index=False,
+        )[TS_VAR]
+        .sum()
+        .assign(realm="Global")
+    )
+
+    plot_df = pd.concat([global_df, df], ignore_index=True)
+    plot_df["value_plot"] = plot_df[TS_VAR] / 1e6
+
+    realm_order = [
+        realm for realm in REALM_ORDER
+        if realm in set(df["realm"])
+    ]
+
+    def prepare_panel(src, title):
+        """Prepare smoothed historical and visually continuous future series."""
+        hist = src[
+            (src["scenario"] == "historical")
+            & (src["year"] <= 2014)
+        ].copy()
+
+        hp = (
+            hist.pivot_table(
+                index="year",
+                columns="source",
+                values="value_plot",
+                aggfunc="mean",
+            )
+            .sort_index()
+            .reindex(columns=GCMS)
+        )
+
+        missing = [gcm for gcm in GCMS if hp[gcm].dropna().empty]
+        if missing:
+            raise RuntimeError(
+                f"Figure 2 historical panel {title} lacks GCMs: {missing}"
+            )
+
+        hist_mean = smooth(hp.mean(axis=1))
+        hist_min = smooth(hp.min(axis=1))
+        hist_max = smooth(hp.max(axis=1))
+
+        hist_clean = hist_mean.dropna()
+        if hist_clean.empty:
+            raise RuntimeError(f"Figure 2 historical panel {title} is empty")
+
+        last_hist_year = int(hist_clean.index.max())
+        last_hist_value = float(hist_clean.iloc[-1])
+        last_hist_min = float(hist_min.dropna().iloc[-1])
+        last_hist_max = float(hist_max.dropna().iloc[-1])
+
+        future_stats = {}
+
+        for sc in FUTURE_S:
+            future = src[
+                (src["scenario"] == sc)
+                & (src["year"] >= JOIN_YEAR)
+            ].copy()
+
+            fp = (
+                future.pivot_table(
+                    index="year",
+                    columns="source",
+                    values="value_plot",
+                    aggfunc="mean",
+                )
+                .sort_index()
+                .reindex(columns=GCMS)
+            )
+
+            missing = [gcm for gcm in GCMS if fp[gcm].dropna().empty]
+            if missing:
+                raise RuntimeError(
+                    f"Figure 2 {title}/{sc} lacks GCMs: {missing}"
+                )
+
+            mean_raw = fp.mean(axis=1)
+            min_raw = fp.min(axis=1)
+            max_raw = fp.max(axis=1)
+
+            mean_clean = mean_raw.dropna()
+            if mean_clean.empty:
+                continue
+
+            # First correction, align the raw future ensemble mean to the
+            # final smoothed historical ensemble mean.
+            raw_shift = last_hist_value - float(mean_clean.iloc[0])
+
+            future_mean = smooth(mean_raw + raw_shift)
+            future_min = smooth(min_raw + raw_shift)
+            future_max = smooth(max_raw + raw_shift)
+
+            # Separate smoothing can reintroduce a small offset. Apply a
+            # second plotting-only correction after smoothing so the first
+            # displayed future value equals the final historical value.
+            future_clean = future_mean.dropna()
+            if future_clean.empty:
+                continue
+
+            smooth_shift = last_hist_value - float(future_clean.iloc[0])
+            future_mean = future_mean + smooth_shift
+            future_min = future_min + smooth_shift
+            future_max = future_max + smooth_shift
+
+            # Explicitly prepend the historical endpoint. This removes any
+            # visible break between 2014 and 2015 for both line and shading.
+            line_index = pd.Index(
+                np.concatenate([[last_hist_year], future_mean.index.values]),
+                name="year",
+            )
+
+            future_stats[sc] = {
+                "mean": pd.Series(
+                    np.concatenate([[last_hist_value], future_mean.values]),
+                    index=line_index,
+                ),
+                "min": pd.Series(
+                    np.concatenate([[last_hist_min], future_min.values]),
+                    index=line_index,
+                ),
+                "max": pd.Series(
+                    np.concatenate([[last_hist_max], future_max.values]),
+                    index=line_index,
+                ),
+            }
+
+            log(
+                f"[Figure 2 join] {title}, {sc}: "
+                f"historical endpoint={last_hist_value:.6f}, "
+                f"future start={future_stats[sc]['mean'].iloc[1]:.6f}, "
+                f"raw shift={raw_shift:.6f}, "
+                f"post-smoothing shift={smooth_shift:.6f}"
+            )
+
+        return hist_mean, hist_min, hist_max, future_stats
+
+    def draw_panel(ax, src, title, show_ylabel=True):
+        hist_mean, hist_min, hist_max, future_stats = prepare_panel(src, title)
+
+        ax.fill_between(
+            hist_mean.index,
+            hist_min.values,
+            hist_max.values,
+            color=SCEN_COLOR["historical"],
+            alpha=0.18,
+            linewidth=0,
+        )
+        ax.plot(
+            hist_mean.index,
+            hist_mean.values,
+            color=SCEN_COLOR["historical"],
+            lw=2.2,
+        )
+
+        for sc in FUTURE_S:
+            stats = future_stats.get(sc)
+            if stats is None:
+                continue
+
+            ax.fill_between(
+                stats["mean"].index,
+                stats["min"].values,
+                stats["max"].values,
+                color=SCEN_COLOR[sc],
+                alpha=0.18,
+                linewidth=0,
+            )
+            ax.plot(
+                stats["mean"].index,
+                stats["mean"].values,
+                color=SCEN_COLOR[sc],
+                lw=2.2,
+            )
+
+        ax.set_title(title, fontsize=FS["title"], fontweight="bold")
+        if show_ylabel:
+            ax.set_ylabel("GDW area (million km²)", fontsize=FS["axis"])
+        else:
+            ax.set_ylabel("")
+
+        ax.set_xlim(1979, 2050)
+
+        y_low = min(
+            float(hist_min.min()),
+            *[float(v["min"].min()) for v in future_stats.values()],
+        )
+        y_high = max(
+            float(hist_max.max()),
+            *[float(v["max"].max()) for v in future_stats.values()],
+        )
+        y_pad = max((y_high - y_low) * 0.06, 0.01)
+        ax.set_ylim(y_low - y_pad, y_high + y_pad)
+
+        ax.tick_params(labelsize=FS["tick"])
+        ax.grid(axis="y", alpha=0.25)
+        ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=5))
+
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+
+    legend_handles = [
+        Line2D(
+            [0], [0],
+            color=SCEN_COLOR[s],
+            lw=3,
+            label=SCEN_LABEL[s],
+        )
+        for s in SCENARIOS
+    ] + [
+        Patch(
+            facecolor="0.65",
+            alpha=0.25,
+            label="Five-GCM min-max range",
+        )
+    ]
+
+    # Three rows and three columns. The side cells in the top row are not
+    # created, leaving genuine blank space around the centred Global panel.
+    fig = plt.figure(figsize=(18, 14.5), dpi=300)
+    gs = fig.add_gridspec(
+        3,
+        3,
+        left=0.07,
+        right=0.99,
+        top=0.96,
+        bottom=0.10,
+        hspace=0.42,
+        wspace=0.24,
+    )
+
+    ax_global = fig.add_subplot(gs[0, 1])
+    draw_panel(
+        ax_global,
+        plot_df[plot_df["realm"] == "Global"],
+        "Global",
+        show_ylabel=True,
+    )
+
+    realm_positions = [
+        (1, 0), (1, 1), (1, 2),
+        (2, 0), (2, 1), (2, 2),
+    ]
+
+    for realm, (row, col) in zip(realm_order, realm_positions):
+        ax = fig.add_subplot(gs[row, col])
+        draw_panel(
+            ax,
+            plot_df[plot_df["realm"] == realm],
+            realm,
+            show_ylabel=(col == 0),
+        )
+
+    fig.legend(
+        handles=legend_handles,
+        frameon=False,
+        ncol=5,
+        fontsize=FS["legend"],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.025),
+        columnspacing=1.8,
+        handletextpad=0.7,
+    )
+
+    out = OUT / "figure2_global_and_realm_timeseries.png"
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    fig.savefig(out.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+    fig.savefig(out.with_suffix(".svg"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log(f"Saved: {out}")
+
+def plot_figure3_lollipop():
+    """Figure 3: realm-level net changes with five-GCM spread.
+
+    Typography: uses FS3 on an 18 x 6.5 inch canvas rather than the former
+    29 x 8.8, so labels print roughly twice as large at a given column width.
+    The x-axis tick count drops from five to four because the larger tick
+    labels would otherwise collide between adjacent panels, and the left and
+    bottom margins are widened for the realm names and the legend.
+
+    Four wide scenario panels are shown in one row for the six biogeographic
+    realms only; the global aggregate is intentionally excluded because it is
+    not a seventh comparable realm. Realm labels appear only on the first
+    panel because they repeat across scenarios. Each estimate is displayed
+    as a lollipop with the five-GCM min-max range:
+
+        |-----o-----|
+
+    Filled circles show total net change. Open squares show net change without
+    land-use impact. Marker positions are five-GCM means and horizontal
+    whiskers show the full minimum-maximum range across the five GCMs.
+    """
+    log("Building Figure 3 lollipop plot for six realms with GCM spread")
+
+    # Figure 1b calls this same builder, guaranteeing that Figure 1b and
+    # Figure 3 use identical realm changes, baselines, periods, and units.
+    gcm_table, _ = compute_figure3_realm_gcm_data()
+    gcm_table = gcm_table[gcm_table["realm"].isin(REALM_ORDER)].copy()
+
+    summary = (
+        gcm_table.groupby(["scenario", "realm"])
+        .agg(
+            total_mean=("delta_total", "mean"),
+            total_min=("delta_total", "min"),
+            total_max=("delta_total", "max"),
+            nonlu_mean=("delta_nonlu", "mean"),
+            nonlu_min=("delta_nonlu", "min"),
+            nonlu_max=("delta_nonlu", "max"),
+        )
+        .reset_index()
+    )
+
+    summary["total_range_width"] = summary["total_max"] - summary["total_min"]
+    summary["nonlu_range_width"] = summary["nonlu_max"] - summary["nonlu_min"]
+
+    gcm_table.to_csv(OUT / "figure3_per_gcm_net_change.csv", index=False)
+    summary.to_csv(OUT / "figure3_gcm_mean_and_range.csv", index=False)
+
+    # Explicit diagnostics for the two realms with visually narrow ranges.
+    for sc in SCENARIOS:
+        for realm in ["Indo-Malayan", "Australasian & Oceanian"]:
+            check = gcm_table[
+                (gcm_table["scenario"] == sc)
+                & (gcm_table["realm"] == realm)
+            ][["source", "delta_total", "delta_nonlu"]]
+            if not check.empty:
+                log(
+                    f"Figure 3 spread check, {SCEN_LABEL[sc]}, {realm}:\n"
+                    f"{check.to_string(index=False)}"
+                )
+
+    realm_order = [r for r in REALM_ORDER if r in set(summary["realm"])]
+    y_pos = np.arange(len(realm_order))[::-1]
+
+    fig, axes = plt.subplots(
+        1,
+        len(SCENARIOS),
+        figsize=(15.5, 5.6),
+        dpi=300,
+        sharey=True,
+        constrained_layout=False,
+    )
+
+    total_offset = 0.15
+    nonlu_offset = -0.15
+    cap_half = 0.07
+
+    for col_i, sc in enumerate(SCENARIOS):
+        ax = axes[col_i]
+
+        panel = (
+            summary[summary["scenario"] == sc]
+            .set_index("realm")
+            .reindex(realm_order)
+        )
+
+        ax.axvline(0, color="0.55", lw=1.4, zorder=0)
+
+        for yi, realm in zip(y_pos, realm_order):
+            row = panel.loc[realm]
+
+            # Total net change: filled circle
+            total_mean = float(row["total_mean"])
+            total_min = float(row["total_min"])
+            total_max = float(row["total_max"])
+            total_color = "#2166AC" if total_mean >= 0 else "#B2182B"
+
+            ax.plot(
+                [total_min, total_max],
+                [yi + total_offset, yi + total_offset],
+                color="0.35",
+                lw=3.0,
+                ls="-",
+                solid_capstyle="butt",
+                zorder=2,
+            )
+            ax.plot(
+                [total_min, total_min],
+                [yi + total_offset - cap_half, yi + total_offset + cap_half],
+                color="0.35",
+                lw=2.1,
+                zorder=2,
+            )
+            ax.plot(
+                [total_max, total_max],
+                [yi + total_offset - cap_half, yi + total_offset + cap_half],
+                color="0.35",
+                lw=2.1,
+                zorder=2,
+            )
+            ax.plot(
+                total_mean,
+                yi + total_offset,
+                marker="o",
+                ms=11,
+                mfc=total_color,
+                mec=total_color,
+                mew=1.7,
+                zorder=4,
+            )
+
+            # Net change without land-use impact: open square
+            nonlu_mean = float(row["nonlu_mean"])
+            nonlu_min = float(row["nonlu_min"])
+            nonlu_max = float(row["nonlu_max"])
+            nonlu_color = "#2166AC" if nonlu_mean >= 0 else "#B2182B"
+
+            ax.plot(
+                [nonlu_min, nonlu_max],
+                [yi + nonlu_offset, yi + nonlu_offset],
+                color="0.35",
+                lw=2.8,
+                ls="--",
+                dash_capstyle="butt",
+                zorder=2,
+            )
+            ax.plot(
+                [nonlu_min, nonlu_min],
+                [yi + nonlu_offset - cap_half, yi + nonlu_offset + cap_half],
+                color="0.35",
+                lw=2.1,
+                zorder=2,
+            )
+            ax.plot(
+                [nonlu_max, nonlu_max],
+                [yi + nonlu_offset - cap_half, yi + nonlu_offset + cap_half],
+                color="0.35",
+                lw=2.1,
+                zorder=2,
+            )
+            ax.plot(
+                nonlu_mean,
+                yi + nonlu_offset,
+                marker="s",
+                ms=10.5,
+                mfc="white",
+                mec=nonlu_color,
+                mew=2.2,
+                zorder=4,
+            )
+
+        ax.set_title(
+            SCEN_LABEL[sc],
+            fontsize=FS3["title"],
+            fontweight="bold",
+            pad=12,
+        )
+
+        ax.set_yticks(y_pos)
+
+        # Realm names are shown once only, on the first panel.
+        if col_i == 0:
+            ax.set_yticklabels(
+                realm_order,
+                fontsize=FS3["tick"],
+                fontweight="bold",
+            )
+            ax.tick_params(axis="y", labelleft=True, length=0, pad=9)
+        else:
+            ax.tick_params(axis="y", labelleft=False, length=0)
+
+        ax.set_xlabel(
+            "Net area change (10\u00b3 km\u00b2)",
+            fontsize=FS3["axis"],
+            fontweight="bold",
+            labelpad=10,
+        )
+
+        # nbins 5 -> 4 so the larger tick labels do not overlap at the
+        # panel edges.
+        ax.xaxis.set_major_locator(
+            matplotlib.ticker.MaxNLocator(nbins=4, prune="both")
+        )
+        ax.tick_params(axis="x", labelsize=FS3["tick"])
+        ax.grid(axis="x", alpha=0.22, linewidth=1.0, zorder=0)
+
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+
+    legend_handles = [
+        Line2D(
+            [0], [0],
+            color="0.35",
+            marker="o",
+            mfc="0.35",
+            mec="0.35",
+            lw=3.0,
+            ls="-",
+            ms=11,
+            label="Total net change",
+        ),
+        Line2D(
+            [0], [0],
+            color="0.35",
+            marker="s",
+            mfc="white",
+            mec="0.35",
+            mew=2.2,
+            lw=2.8,
+            ls="--",
+            ms=10.5,
+            label="Net change without land-use impact",
+        ),
+        Line2D(
+            [0], [0],
+            color="#2166AC",
+            marker="o",
+            mfc="#2166AC",
+            mec="#2166AC",
+            lw=0,
+            ms=10,
+            label="Net gain",
+        ),
+        Line2D(
+            [0], [0],
+            color="#B2182B",
+            marker="o",
+            mfc="#B2182B",
+            mec="#B2182B",
+            lw=0,
+            ms=10,
+            label="Net loss",
+        ),
+    ]
+
+    fig.legend(
+        handles=legend_handles,
+        ncol=2,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.005),
+        frameon=False,
+        fontsize=FS3["legend"],
+        handlelength=2.6,
+        handletextpad=0.9,
+        columnspacing=2.6,
+    )
+
+    # left widened for the realm names, bottom for the legend and x-label.
+    fig.subplots_adjust(
+        left=0.155,
+        right=0.995,
+        top=0.89,
+        bottom=0.28,
+        wspace=0.12,
+    )
+
+    for ext in ("png", "pdf", "svg"):
+        fig.savefig(OUT / f"figure3_lollipop_net_change.{ext}", dpi=300)
+
+    plt.close(fig)
+    log("Saved: figure3_lollipop_net_change.png")
+
+
+def compute_figure3_realm_gcm_data():
+    """
+    Shared data builder for the Figure 3 variants: per-GCM realm-level
+    delta_total and delta_nonlu (10^3 km2), for every scenario, plus the
+    ensemble-mean table. Same computation as the original plot_figure3_
+    lollipop(), factored out so all three variants use identical numbers.
+    """
+    df = annual_realm_from_parquet([COL_TOTAL, COL_NONLU], keep_gcm=True)
+    rows = []
+    for sc in SCENARIOS:
+        blo, bhi = HIST_BASE if sc == "historical" else HIST_LAST
+        flo, fhi = HIST_LAST if sc == "historical" else FUT_LAST
+        db  = df[df["scenario"].eq("historical") & df["year"].between(blo, bhi)]
+        df2 = df[df["scenario"].eq(sc)           & df["year"].between(flo, fhi)]
+        for gcm in GCMS:
+            b = db[db["source"] == gcm].groupby("realm", as_index=False)[[COL_TOTAL, COL_NONLU]].mean()
+            f = df2[df2["source"] == gcm].groupby("realm", as_index=False)[[COL_TOTAL, COL_NONLU]].mean()
+            m = b.merge(f, on="realm", suffixes=("_b", "_f"), how="outer")
+            m["delta_total"] = (m[f"{COL_TOTAL}_f"] - m[f"{COL_TOTAL}_b"]) / 1e3
+            m["delta_nonlu"] = (m[f"{COL_NONLU}_f"] - m[f"{COL_NONLU}_b"]) / 1e3
+            m["scenario"] = sc
+            m["source"] = gcm
+            rows.append(m)
+    gcm_tab = pd.concat(rows, ignore_index=True)
+    tab = gcm_tab.groupby(["scenario", "realm"], as_index=False)[["delta_total", "delta_nonlu"]].mean()
+    return gcm_tab, tab
+
+
+def _realm_gcm_stats(gcm_tab, metric_col):
+    """
+    Per (scenario, realm): mean, min, max, and sign-agreement fraction
+    across GCMs for the given metric column.
+    """
+    rows = []
+    for (sc, r), g in gcm_tab.groupby(["scenario", "realm"]):
+        vals = g[metric_col].dropna()
+        n = len(vals)
+        if n == 0:
+            rows.append({"scenario": sc, "realm": r, "mean": np.nan, "min": np.nan,
+                         "max": np.nan, "agree_frac": np.nan, "n_gcm": 0})
+            continue
+        n_pos = int((vals > 0).sum())
+        n_neg = int((vals < 0).sum())
+        n_agree = max(n_pos, n_neg)
+        rows.append({
+            "scenario": sc, "realm": r,
+            "mean": float(vals.mean()), "min": float(vals.min()), "max": float(vals.max()),
+            "agree_frac": n_agree / n, "n_gcm": n,
+        })
+    return pd.DataFrame(rows)
+
+
+def _agree_color(frac):
+    """3-tier traffic-light color for GCM sign-agreement fraction."""
+    if not np.isfinite(frac):
+        return "0.6"
+    if frac >= 0.8:
+        return "#1B7837"   # 4/5 or 5/5 agree
+    if frac >= 0.6:
+        return "#EF9F27"   # 3/5 agree (bare majority)
+    return "#E24B4A"       # <=2/5 agree (essentially a coin flip)
+
+
+def _figure3_base_layout(fig_title_suffix, out_name):
+    """
+    Shared figure/axes scaffold for the three variants: 1 row x len(SCENARIOS)
+    columns, realms on the y-axis, matching the original single-row design.
+    Returns (fig, axes, realms, y_pos) for the caller to draw into.
+    """
+    gcm_tab, tab = compute_figure3_realm_gcm_data()
+    stats_total = _realm_gcm_stats(gcm_tab, "delta_total")
+    stats_nonlu = _realm_gcm_stats(gcm_tab, "delta_nonlu")
+
+    realms = [r for r in REALM_ORDER if r in set(tab["realm"])]
+    y_pos  = np.arange(len(realms))[::-1]
+
+    fig, axes = plt.subplots(1, len(SCENARIOS), figsize=(6*len(SCENARIOS), 8), dpi=300)
+    return fig, axes, realms, y_pos, stats_total, stats_nonlu
+
+
+def plot_figure3_variant_a_capsule():
+    """
+    Variant A: GCM min-max range drawn as a soft translucent capsule behind
+    the existing stem+marker, on the same row (no vertical offset, no new
+    row). The capsule width shows the actual spread in km2, so this is the
+    most information-dense of the three variants.
+    """
+    log("Building Figure 3 variant A (translucent range capsule)")
+    fig, axes, realms, y_pos, stats_total, stats_nonlu = _figure3_base_layout(
+        "variant A", "figure3_variant_a_capsule.png")
+
+    for ax, sc in zip(axes, SCENARIOS):
+        st = stats_total[stats_total["scenario"] == sc].set_index("realm").reindex(realms)
+        sn = stats_nonlu[stats_nonlu["scenario"] == sc].set_index("realm").reindex(realms)
+        ax.axvline(0, color="0.60", lw=1.0, zorder=0)
+
+        for yi, realm in zip(y_pos, realms):
+            for row, marker, off, ls in [(st, "o", 0.10, "-"), (sn, "s", -0.10, "--")]:
+                if realm not in row.index or not np.isfinite(row.loc[realm, "mean"]):
+                    continue
+                v, lo, hi = row.loc[realm, ["mean", "min", "max"]]
+                c = "#2166AC" if v >= 0 else "#B2182B"
+                if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                    ax.plot([lo, hi], [yi+off, yi+off], color=c, lw=10,
+                             alpha=0.15, solid_capstyle="round", zorder=1)
+                ax.plot([0, v], [yi+off, yi+off], color=c, lw=2.2, ls=ls,
+                         solid_capstyle="round", zorder=2)
+                mfc = c if marker == "o" else "white"
+                ax.plot(v, yi+off, marker, color=c, mfc=mfc, ms=8, mew=1.8, zorder=3)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(realms if ax is axes[0] else [], fontsize=FS["tick"], fontweight="bold")
+        ax.set_title(SCEN_LABEL[sc], fontsize=FS["title"], fontweight="bold")
+        ax.set_xlabel(r"Area change ($10^3$ km$^2$)", fontsize=FS["axis"], fontweight="bold")
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=5, prune="both"))
+        ax.tick_params(axis="x", labelsize=FS["tick"])
+        ax.grid(axis="x", alpha=0.22, linewidth=0.8)
+        for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+
+    fig.legend(
+        handles=[
+            Line2D([0],[0], color="0.3", marker="o", lw=2.2, ms=8, label="Total GDW"),
+            Line2D([0],[0], color="0.3", marker="s", mfc="white", mew=1.8, lw=2.2, ls="--", ms=8,
+                   label="GDW without landuse impact"),
+            Line2D([0],[0], color="#2166AC", lw=2.2, label="Gain"),
+            Line2D([0],[0], color="#B2182B", lw=2.2, label="Loss"),
+            Patch(facecolor="0.4", alpha=0.15, label="GCM min-max range (capsule width)"),
+        ],
+        ncol=3, loc="lower center", bbox_to_anchor=(0.5, 0.00),
+        frameon=False, fontsize=FS["legend"], handlelength=2.0, columnspacing=1.6,
+    )
+    fig.tight_layout(rect=[0.03, 0.10, 1.0, 1.0])
+    fig.savefig(OUT / "figure3_variant_a_capsule.png", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "figure3_variant_a_capsule.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "figure3_variant_a_capsule.svg", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log("Saved: figure3_variant_a_capsule.png")
+
+
+def plot_figure3_variant_b_opacity():
+    """
+    Variant B: no new visual elements at all. GCM sign-agreement is encoded
+    directly into the existing stem's opacity and linewidth -- solid, thick,
+    opaque stems mean the GCMs agree closely; faint, thin stems mean they
+    don't. This is the cleanest variant since nothing is added to the
+    figure, only the appearance of what's already there changes.
+    """
+    log("Building Figure 3 variant B (stem opacity/width = GCM agreement)")
+    fig, axes, realms, y_pos, stats_total, stats_nonlu = _figure3_base_layout(
+        "variant B", "figure3_variant_b_opacity.png")
+
+    for ax, sc in zip(axes, SCENARIOS):
+        st = stats_total[stats_total["scenario"] == sc].set_index("realm").reindex(realms)
+        sn = stats_nonlu[stats_nonlu["scenario"] == sc].set_index("realm").reindex(realms)
+        ax.axvline(0, color="0.60", lw=1.0, zorder=0)
+
+        for yi, realm in zip(y_pos, realms):
+            for row, marker, off, ls in [(st, "o", 0.10, "-"), (sn, "s", -0.10, "--")]:
+                if realm not in row.index or not np.isfinite(row.loc[realm, "mean"]):
+                    continue
+                v, frac = row.loc[realm, ["mean", "agree_frac"]]
+                c = "#2166AC" if v >= 0 else "#B2182B"
+                frac = frac if np.isfinite(frac) else 0.6
+                alpha = 0.30 + 0.65 * frac      # 0.30 (low agreement) to 0.95 (full agreement)
+                lw    = 1.0 + 2.5 * frac        # thin (low agreement) to thick (full agreement)
+                ax.plot([0, v], [yi+off, yi+off], color=c, lw=lw, ls=ls,
+                         alpha=alpha, solid_capstyle="round", zorder=2)
+                mfc = c if marker == "o" else "white"
+                ax.plot(v, yi+off, marker, color=c, mfc=mfc, ms=8, mew=1.8, alpha=alpha, zorder=3)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(realms if ax is axes[0] else [], fontsize=FS["tick"], fontweight="bold")
+        ax.set_title(SCEN_LABEL[sc], fontsize=FS["title"], fontweight="bold")
+        ax.set_xlabel(r"Area change ($10^3$ km$^2$)", fontsize=FS["axis"], fontweight="bold")
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=5, prune="both"))
+        ax.tick_params(axis="x", labelsize=FS["tick"])
+        ax.grid(axis="x", alpha=0.22, linewidth=0.8)
+        for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+
+    fig.legend(
+        handles=[
+            Line2D([0],[0], color="0.3", marker="o", lw=2.2, ms=8, label="Total GDW"),
+            Line2D([0],[0], color="0.3", marker="s", mfc="white", mew=1.8, lw=2.2, ls="--", ms=8,
+                   label="GDW without landuse impact"),
+            Line2D([0],[0], color="#2166AC", lw=2.2, label="Gain"),
+            Line2D([0],[0], color="#B2182B", lw=2.2, label="Loss"),
+            Line2D([0],[0], color="0.3", lw=3.5, alpha=0.95, label="Strong GCM agreement"),
+            Line2D([0],[0], color="0.3", lw=1.0, alpha=0.30, label="Weak GCM agreement"),
+        ],
+        ncol=3, loc="lower center", bbox_to_anchor=(0.5, 0.00),
+        frameon=False, fontsize=FS["legend"], handlelength=2.0, columnspacing=1.6,
+    )
+    fig.tight_layout(rect=[0.03, 0.11, 1.0, 1.0])
+    fig.savefig(OUT / "figure3_variant_b_opacity.png", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "figure3_variant_b_opacity.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "figure3_variant_b_opacity.svg", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log("Saved: figure3_variant_b_opacity.png")
+
+
+def plot_figure3_variant_c_agreement_dot():
+    """
+    Variant C: existing marks are untouched; a small traffic-light dot is
+    placed just beyond each marker's stem tip, color-coded by GCM sign-
+    agreement fraction. Closest in spirit to Figure 4's hatching, so it
+    stays visually consistent with the rest of the manuscript.
+    """
+    log("Building Figure 3 variant C (agreement dot at stem tip)")
+    fig, axes, realms, y_pos, stats_total, stats_nonlu = _figure3_base_layout(
+        "variant C", "figure3_variant_c_agreement_dot.png")
+
+    for ax, sc in zip(axes, SCENARIOS):
+        st = stats_total[stats_total["scenario"] == sc].set_index("realm").reindex(realms)
+        sn = stats_nonlu[stats_nonlu["scenario"] == sc].set_index("realm").reindex(realms)
+        ax.axvline(0, color="0.60", lw=1.0, zorder=0)
+
+        xr = []
+        for row in (st, sn):
+            xr.extend(row["mean"].dropna().tolist())
+        span = (max(xr) - min(xr)) if xr else 10.0
+        dot_offset = max(span * 0.04, 1.5)
+
+        for yi, realm in zip(y_pos, realms):
+            for row, marker, off, ls in [(st, "o", 0.10, "-"), (sn, "s", -0.10, "--")]:
+                if realm not in row.index or not np.isfinite(row.loc[realm, "mean"]):
+                    continue
+                v, frac = row.loc[realm, ["mean", "agree_frac"]]
+                c = "#2166AC" if v >= 0 else "#B2182B"
+                ax.plot([0, v], [yi+off, yi+off], color=c, lw=2.2, ls=ls,
+                         solid_capstyle="round", zorder=2)
+                mfc = c if marker == "o" else "white"
+                ax.plot(v, yi+off, marker, color=c, mfc=mfc, ms=8, mew=1.8, zorder=3)
+                dot_x = v + (dot_offset if v >= 0 else -dot_offset)
+                ax.plot(dot_x, yi+off, "o", color=_agree_color(frac), ms=5,
+                        mec="white", mew=0.6, zorder=4)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(realms if ax is axes[0] else [], fontsize=FS["tick"], fontweight="bold")
+        ax.set_title(SCEN_LABEL[sc], fontsize=FS["title"], fontweight="bold")
+        ax.set_xlabel(r"Area change ($10^3$ km$^2$)", fontsize=FS["axis"], fontweight="bold")
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=5, prune="both"))
+        ax.tick_params(axis="x", labelsize=FS["tick"])
+        ax.grid(axis="x", alpha=0.22, linewidth=0.8)
+        for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+
+    fig.legend(
+        handles=[
+            Line2D([0],[0], color="0.3", marker="o", lw=2.2, ms=8, label="Total GDW"),
+            Line2D([0],[0], color="0.3", marker="s", mfc="white", mew=1.8, lw=2.2, ls="--", ms=8,
+                   label="GDW without landuse impact"),
+            Line2D([0],[0], color="#2166AC", lw=2.2, label="Gain"),
+            Line2D([0],[0], color="#B2182B", lw=2.2, label="Loss"),
+            Line2D([0],[0], marker="o", color="none", mfc="#1B7837", ms=6, label="4-5/5 GCMs agree"),
+            Line2D([0],[0], marker="o", color="none", mfc="#EF9F27", ms=6, label="3/5 GCMs agree"),
+            Line2D([0],[0], marker="o", color="none", mfc="#E24B4A", ms=6, label="<=2/5 GCMs agree"),
+        ],
+        ncol=4, loc="lower center", bbox_to_anchor=(0.5, 0.00),
+        frameon=False, fontsize=FS["legend"], handlelength=1.6, columnspacing=1.4,
+    )
+    fig.tight_layout(rect=[0.03, 0.11, 1.0, 1.0])
+    fig.savefig(OUT / "figure3_variant_c_agreement_dot.png", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "figure3_variant_c_agreement_dot.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "figure3_variant_c_agreement_dot.svg", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log("Saved: figure3_variant_c_agreement_dot.png")
+
+
+def plot_figure3_variant_d_attribution():
+    """
+    Variant D: attribution bar. Replaces the two overlaid markers (Total
+    GDW, GDW without landuse impact) with a single stacked bar per realm:
+    groundwater-driven segment (= delta_nonlu) + landuse-driven segment
+    (= delta_total - delta_nonlu), summing to the same Total GDW change the
+    lollipop's filled circle shows. Makes the landuse contribution a first-
+    class quantity instead of something the reader infers from the gap
+    between two markers. GCM uncertainty is a single error bar on the
+    combined tip (delta_total), using the same per-GCM range already
+    computed for the other variants. Segment colors reuse Fig 1c/d's
+    groundwater/landuse palette so the two figures read as one visual
+    language rather than two different idioms for the same question.
+    """
+    log("Building Figure 3 variant D (attribution bar: groundwater vs landuse contribution)")
+    fig, axes, realms, y_pos, stats_total, stats_nonlu = _figure3_base_layout(
+        "variant D", "figure3_variant_d_attribution.png")
+
+    GW_LOSS, GW_GAIN = "#08306B", "#6BAED6"
+    LU_LOSS, LU_GAIN = "#7F2704", "#FDAE6B"
+    bar_h = 0.5
+
+    attribution_rows = []
+
+    for ax, sc in zip(axes, SCENARIOS):
+        st = stats_total[stats_total["scenario"] == sc].set_index("realm").reindex(realms)
+        sn = stats_nonlu[stats_nonlu["scenario"] == sc].set_index("realm").reindex(realms)
+        ax.axvline(0, color="0.60", lw=1.0, zorder=0)
+
+        for yi, realm in zip(y_pos, realms):
+            if realm not in st.index or not np.isfinite(st.loc[realm, "mean"]):
+                continue
+            total_v = float(st.loc[realm, "mean"])
+            gw_v = float(sn.loc[realm, "mean"]) if realm in sn.index and np.isfinite(sn.loc[realm, "mean"]) else 0.0
+            lu_v = total_v - gw_v
+
+            gw_color = GW_GAIN if gw_v >= 0 else GW_LOSS
+            lu_color = LU_GAIN if lu_v >= 0 else LU_LOSS
+
+            ax.barh(yi, gw_v, left=0.0, height=bar_h, color=gw_color,
+                   edgecolor="white", linewidth=1.0, zorder=2)
+            ax.barh(yi, lu_v, left=gw_v, height=bar_h, color=lu_color,
+                   edgecolor="white", linewidth=1.0, zorder=2)
+
+            lo, hi = st.loc[realm, ["min", "max"]]
+            if np.isfinite(lo) and np.isfinite(hi):
+                ax.plot([lo, hi], [yi, yi], color="black", lw=1.6, zorder=4, solid_capstyle="round")
+                ax.plot([lo, lo], [yi-bar_h*0.25, yi+bar_h*0.25], color="black", lw=1.6, zorder=4)
+                ax.plot([hi, hi], [yi-bar_h*0.25, yi+bar_h*0.25], color="black", lw=1.6, zorder=4)
+
+            attribution_rows.append({
+                "scenario": sc, "realm": realm,
+                "total_delta_1e3km2": round(total_v, 2),
+                "groundwater_delta_1e3km2": round(gw_v, 2),
+                "landuse_delta_1e3km2": round(lu_v, 2),
+                "gcm_min_1e3km2": round(float(lo), 2) if np.isfinite(lo) else None,
+                "gcm_max_1e3km2": round(float(hi), 2) if np.isfinite(hi) else None,
+            })
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(realms if ax is axes[0] else [], fontsize=FS["tick"], fontweight="bold")
+        ax.set_title(SCEN_LABEL[sc], fontsize=FS["title"], fontweight="bold")
+        ax.set_xlabel(r"Area change ($10^3$ km$^2$)", fontsize=FS["axis"], fontweight="bold")
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=5, prune="both"))
+        ax.tick_params(axis="x", labelsize=FS["tick"])
+        ax.grid(axis="x", alpha=0.22, linewidth=0.8)
+        for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+
+    fig.legend(
+        handles=[
+            Patch(facecolor=GW_LOSS, label="Groundwater-driven loss"),
+            Patch(facecolor=GW_GAIN, label="Groundwater-driven gain"),
+            Patch(facecolor=LU_LOSS, label="Landuse-driven loss"),
+            Patch(facecolor=LU_GAIN, label="Landuse-driven gain"),
+            Line2D([0],[0], color="black", lw=1.6, label="GCM min-max (on Total GDW)"),
+        ],
+        ncol=3, loc="lower center", bbox_to_anchor=(0.5, 0.00),
+        frameon=False, fontsize=FS["legend"], handlelength=1.6, columnspacing=1.4,
+    )
+    fig.tight_layout(rect=[0.03, 0.11, 1.0, 1.0])
+    fig.savefig(OUT / "figure3_variant_d_attribution.png", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "figure3_variant_d_attribution.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "figure3_variant_d_attribution.svg", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log("Saved: figure3_variant_d_attribution.png")
+
+    attr_df = pd.DataFrame(attribution_rows)
+    if not attr_df.empty:
+        out_csv = OUT / "figure3_variant_d_attribution_table.csv"
+        attr_df.to_csv(out_csv, index=False)
+        log(f"Saved: {out_csv}")
+    return attr_df
+
+# =============================================================================
+# FIGURE 4 (with GCM sign-agreement hatching, 3/5 threshold)
+# =============================================================================
+
+def plot_figure4_biome_map():
+    """Figure 4 with restrained, signal-aware uncertainty hatching.
+
+    Hatching is applied only where both conditions are met:
+
+    1. the five-GCM range of percentage change crosses zero, meaning that
+       at least one GCM projects a gain and another projects a loss; and
+    2. the absolute ensemble-mean percentage change is below 20%.
+
+    Strong ensemble signals are therefore left unobscured even when one model
+    differs in sign. Coastlines are intentionally light and thin so the
+    biome-realm patterns remain visually dominant.
+    """
+    log("Building Figure 4")
+
+    table = compute_biome_realm_pcr_table()
+    gdf = load_biome_realm_gdf_checked(table)
+    value_col = "normalized_change_pct"
+    components = list(PCR_COLS_NORM.keys())
+    scenarios = SCENARIOS
+
+    comp_labels = {
+        "Groundwater Impact Only": "Groundwater only",
+        "Land-use Impact Only": "Land-use only",
+        "Groundwater + Land-use Impact": "Combined",
+    }
+
+    # Compute the GCM-resolved percentage changes for the same component shown
+    # in each map. The min and max determine whether the model range crosses 0.
+    uncertainty_by_component = {}
+
+    for comp, col in PCR_COLS.items():
+        per = compute_biome_realm_pcr_table_per_gcm(component_col=col)
+
+        counts = per.groupby("scenario")["source"].nunique()
+        if any(counts.get(sc, 0) != len(GCMS) for sc in scenarios):
+            raise RuntimeError(
+                f"Figure 4 {comp} lacks GCMs: {counts.to_dict()}"
+            )
+
+        spread = (
+            per.groupby(["scenario", "biome_realm"], as_index=False)
+            .agg(
+                gcm_pct_min=("normalized_change_pct", "min"),
+                gcm_pct_max=("normalized_change_pct", "max"),
+                n_gcm=("source", "nunique"),
+            )
+        )
+        spread["component"] = comp
+        uncertainty_by_component[comp] = spread
+
+    uncertainty_full = pd.concat(
+        uncertainty_by_component.values(),
+        ignore_index=True,
+    )
+    uncertainty_full.to_csv(
+        OUT / "figure4_component_gcm_percentage_ranges.csv",
+        index=False,
+    )
+
+    nrows, ncols = len(scenarios), len(components)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(18, 16),
+        dpi=300,
+        subplot_kw={"projection": ccrs.Robinson()},
+        gridspec_kw={"hspace": -0.02, "wspace": 0.03},
+    )
+    axes = np.asarray(axes).reshape(nrows, ncols)
+    norm = TwoSlopeNorm(vcenter=0, vmin=-PCR_VLIM, vmax=PCR_VLIM)
+
+    for r, sc in enumerate(scenarios):
+        for c, comp in enumerate(components):
+            ax = axes[r, c]
+
+            add_map_background(
+                ax,
+                white=True,
+                coastline_width=0.55,
+                coastline_color="0.48",
+            )
+
+            d = table[
+                (table["scenario"] == sc)
+                & (table["component"] == comp)
+            ][["biome_realm", value_col]]
+
+            spread = uncertainty_by_component[comp]
+            spread = spread[spread["scenario"] == sc][
+                ["biome_realm", "gcm_pct_min", "gcm_pct_max", "n_gcm"]
+            ]
+
+            pg = (
+                gdf.merge(d, on="biome_realm", how="left")
+                .merge(spread, on="biome_realm", how="left")
+            )
+
+            pg.plot(
+                column=value_col,
+                ax=ax,
+                transform=ccrs.PlateCarree(),
+                cmap=CMAP_DIVERGING,
+                norm=norm,
+                linewidth=0,
+                missing_kwds={"color": "white"},
+                zorder=2,
+            )
+
+            # Hatch only weak signals for which the five-GCM range crosses 0.
+            pg["range_crosses_zero"] = (
+                (pg["gcm_pct_min"] < 0)
+                & (pg["gcm_pct_max"] > 0)
+            )
+            pg["weak_ensemble_signal"] = (
+                pg[value_col].abs() < FIG4_WEAK_CHANGE_THRESHOLD_PCT
+            )
+            uncertain = pg[
+                pg["range_crosses_zero"]
+                & pg["weak_ensemble_signal"]
+                & pg["n_gcm"].eq(len(GCMS))
+            ]
+
+            if not uncertain.empty:
+                ax.add_geometries(
+                    uncertain.geometry,
+                    crs=ccrs.PlateCarree(),
+                    facecolor="none",
+                    edgecolor="0.38",
+                    hatch="//",
+                    linewidth=0.20,
+                    zorder=6,
+                )
+
+            if r == 0:
+                ax.set_title(
+                    comp_labels[comp],
+                    fontsize=FS["title"],
+                    fontweight="bold",
+                )
+
+            if c == 0:
+                ax.text(
+                    -0.06,
+                    0.5,
+                    SCEN_LABEL[sc],
+                    transform=ax.transAxes,
+                    rotation=90,
+                    va="center",
+                    ha="right",
+                    fontsize=FS["axis"],
+                    fontweight="bold",
+                )
+
+    # The uncertainty legend is placed above the colorbar, separated from the
+    # maps and the colour-scale title. Only the hatched category is explained,
+    # because the absence of hatching needs no separate legend item.
+    hatch_handle = Patch(
+        facecolor="white",
+        edgecolor="0.38",
+        hatch="//",
+        linewidth=0.6,
+        label=(
+            "Five-GCM range crosses zero and "
+            f"|ensemble change| < {FIG4_WEAK_CHANGE_THRESHOLD_PCT:.0f}%"
+        ),
+    )
+
+    fig.legend(
+        handles=[hatch_handle],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.062),
+        frameon=False,
+        fontsize=FS["legend"],
+        handlelength=2.2,
+        handleheight=1.1,
+    )
+
+    cax = fig.add_axes([0.20, 0.032, 0.60, 0.014])
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=CMAP_DIVERGING)
+    cb = fig.colorbar(
+        sm,
+        cax=cax,
+        orientation="horizontal",
+        ticks=[-15, -10, -5, 0, 5, 10, 15],
+        extend="both",
+    )
+    cb.set_label(
+        "Change relative to the 2005–2014 baseline (%)",
+        fontsize=FS["axis"],
+    )
+    cb.ax.tick_params(labelsize=FS["tick"])
+
+    fig.savefig(
+        OUT / "figure4_biome_realm_component_maps.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    fig.savefig(OUT / "figure4_biome_realm_component_maps.pdf",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    fig.savefig(OUT / "figure4_biome_realm_component_maps.svg",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+    log("Saved: figure4_biome_realm_component_maps.png")
+
+
+def plot_s1_persistence_class():
+    log("Building S1: future persistence class map")
+
+    fut_clim   = open_monthly_clim_da("ssp370", PIXEL_VAR)
+    fut_months = (fut_clim >= BASELINE_MIN).sum("month")
+
+    out_nc = OUT / "ssp370_future_persistence_class_per_pixel.nc"
+    if not out_nc.exists():
+        pers = xr.full_like(fut_months, np.nan, dtype="float32")
+        pers = pers.where(~((fut_months >= 1) & (fut_months <= 3)), 1)
+        pers = pers.where(~((fut_months >= 4) & (fut_months <= 6)), 2)
+        pers = pers.where(~(fut_months >= 7), 3)
+        pers.name = "future_persistence_class"
+        pers.to_netcdf(out_nc)
+    else:
+        with xr.open_dataset(out_nc) as ds:
+            pers = ds["future_persistence_class"]
+
+    pers_np = pers.compute().values.astype("float32")
+    lat = pers["lat"].values
+    lon = pers["lon"].values
+
+    PCOL = {1:"#FFD92F", 2:"#66BD3A", 3:"#0571B0"}
+    cmap, norm = discrete_cmap_norm(PCOL)
+
+    fig = plt.figure(figsize=(16, 8), dpi=300)
+    ax  = plt.axes(projection=ccrs.Robinson())
+    add_map_background(ax, white=True)
+    ax.pcolormesh(lon, lat, np.ma.masked_invalid(pers_np),
+                  transform=ccrs.PlateCarree(), cmap=cmap, norm=norm,
+                  shading="auto", rasterized=True, zorder=2)
+
+    handles = [
+        Patch(facecolor=PCOL[1], edgecolor="0.4", label="Episodic (1-3 months)"),
+        Patch(facecolor=PCOL[2], edgecolor="0.4", label="Seasonal (4-6 months)"),
+        Patch(facecolor=PCOL[3], edgecolor="0.4", label="Perennial (7-12 months)"),
+    ]
+    ax.legend(handles=handles, title="Persistence class",
+              frameon=True, framealpha=0.88, edgecolor="0.7",
+              loc="lower right", bbox_to_anchor=(1.0, -0.205),
+              fontsize=FS["legend"], title_fontsize=FS["legend"])
+
+    fig.savefig(OUT / "S1_persistence_class_ssp370.png", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "S1_persistence_class_ssp370.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "S1_persistence_class_ssp370.svg", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log("Saved: S1_persistence_class_ssp370.png")
+
+# =============================================================================
+# S2
+# =============================================================================
+
+def plot_s2_persistence_change():
+    log("Building S2: persistence change maps")
+
+    hist_clim  = open_monthly_clim_da("historical", PIXEL_VAR)
+    fut_clim   = open_monthly_clim_da("ssp370",     PIXEL_VAR)
+
+    hist_months = (hist_clim >= BASELINE_MIN).sum("month")
+    fut_months  = (fut_clim  >= BASELINE_MIN).sum("month")
+
+    month_change = fut_months - hist_months
+
+    def classify(m):
+        out = xr.full_like(m, np.nan, dtype="float32")
+        out = out.where(~((m >= 1) & (m <= 3)), 1)
+        out = out.where(~((m >= 4) & (m <= 6)), 2)
+        out = out.where(~(m >= 7), 3)
+        return out
+
+    hist_class  = classify(hist_months)
+    fut_class   = classify(fut_months)
+    class_change = fut_class - hist_class
+    transition   = hist_class * 10 + fut_class
+
+    valid = np.isfinite(hist_class) & np.isfinite(fut_class)
+    month_change  = month_change.where(valid)
+    class_change  = class_change.where(valid)
+    transition    = transition.where(valid)
+
+    lat = month_change["lat"].values
+    lon = month_change["lon"].values
+    month_np  = month_change.compute().values.astype("float32")
+    class_np  = class_change.compute().values.astype("float32")
+    trans_np  = transition.compute().values.astype("float32")
+
+    norm_month = TwoSlopeNorm(vcenter=0, vmin=-6, vmax=6)
+
+    GAINLOSS = {-2:"#5E2A84",-1:"#B28AC7",0:"#F0F0F0",1:"#66BD3A",2:"#1B7837"}
+    TRANSCOL = {
+        11:"#F7F7F7",12:"#FFE066",13:"#1ABC9C",
+        21:"#F4A261",22:"#F7F7F7",23:"#2A9D8F",
+        31:"#D7191C",32:"#92C5DE",33:"#F7F7F7",
+    }
+    gl_cmap,  gl_norm  = discrete_cmap_norm(GAINLOSS)
+    tr_cmap,  tr_norm  = discrete_cmap_norm(TRANSCOL)
+
+    fig, axes = plt.subplots(
+        1, 3, figsize=(20, 6), dpi=300,
+        subplot_kw={"projection": ccrs.Robinson()},
+        gridspec_kw={"wspace": 0.04},
+    )
+
+    add_map_background(axes[0], white=True)
+    pm = axes[0].pcolormesh(lon, lat, np.ma.masked_invalid(month_np),
+                             transform=ccrs.PlateCarree(), cmap=CMAP_DIVERGING,
+                             norm=norm_month, shading="auto", rasterized=True, zorder=2)
+    axes[0].text(0.01, 0.97, "(a)", transform=axes[0].transAxes,
+                 fontsize=FS["panel"], fontweight="bold", va="top")
+    cax1 = fig.add_axes([0.08, 0.16, 0.22, 0.03])
+    cb1  = fig.colorbar(pm, cax=cax1, orientation="horizontal",
+                        ticks=[-6,-4,-2,0,2,4,6])
+    cb1.set_label("Change in GDW-active months", fontsize=FS["small"])
+    cb1.ax.tick_params(labelsize=FS["small"])
+
+    add_map_background(axes[1], white=True)
+    axes[1].pcolormesh(lon, lat, np.ma.masked_invalid(class_np),
+                       transform=ccrs.PlateCarree(), cmap=gl_cmap, norm=gl_norm,
+                       shading="auto", rasterized=True, zorder=2)
+    axes[1].text(0.01, 0.97, "(b)", transform=axes[1].transAxes,
+                 fontsize=FS["panel"], fontweight="bold", va="top")
+    gl_handles = [
+        Patch(facecolor=GAINLOSS[k], edgecolor="0.4", label=l)
+        for k, l in [(-2,"Loss 2 classes"),(-1,"Loss 1 class"),
+                     (0,"No change"),(1,"Gain 1 class"),(2,"Gain 2 classes")]
+    ]
+    axes[1].legend(handles=gl_handles, frameon=True, framealpha=0.88,
+                   edgecolor="0.7", loc="lower right", bbox_to_anchor=(1.0,-0.60),
+                   fontsize=FS["small"]-1, ncol=1)
+
+    add_map_background(axes[2], white=True)
+    axes[2].pcolormesh(lon, lat, np.ma.masked_invalid(trans_np),
+                       transform=ccrs.PlateCarree(), cmap=tr_cmap, norm=tr_norm,
+                       shading="auto", rasterized=True, zorder=2)
+    axes[2].text(0.01, 0.97, "(c)", transform=axes[2].transAxes,
+                 fontsize=FS["panel"], fontweight="bold", va="top")
+    tr_handles = [
+        Patch(facecolor=TRANSCOL[k], edgecolor="0.4", label=l)
+        for k, l in [(12,"Episodic to Seasonal"),(13,"Episodic to Perennial"),
+                     (21,"Seasonal to Episodic"),(23,"Seasonal to Perennial"),
+                     (31,"Perennial to Episodic"),(32,"Perennial to Seasonal"),
+                     (11,"No class change")]
+    ]
+    axes[2].legend(handles=tr_handles, frameon=True, framealpha=0.88,
+                   edgecolor="0.7", loc="lower right", bbox_to_anchor=(1.0,-0.8),
+                   fontsize=FS["small"]-1, ncol=1)
+
+    fig.savefig(OUT / "S2_persistence_change_maps_ssp370.png", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "S2_persistence_change_maps_ssp370.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "S2_persistence_change_maps_ssp370.svg", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log("Saved: S2_persistence_change_maps_ssp370.png")
+
+# =============================================================================
+# S3
+# =============================================================================
+
+def plot_s3_biome_realm_absolute():
+    log("Building S3: biome-realm absolute change maps")
+
+    table = compute_biome_realm_pcr_table()
+    gdf   = load_biome_realm_gdf_checked(table)
+
+    value_col   = "abs_change_km2"
+    components  = list(PCR_COLS_NORM.keys())
+    scenarios   = SCENARIOS
+    COMP_LABELS = {
+        "Groundwater Impact Only":       "Groundwater-only",
+        "Land-use Impact Only":          "Land-use-only",
+        "Groundwater + Land-use Impact": "Combined",
+    }
+
+    vals = table[value_col].dropna().abs()
+    vlim = float(np.nanpercentile(vals, 95)) if vals.size else 1e4
+    vlim = float(np.ceil(vlim / 1000) * 1000)
+
+    nrows, ncols = len(scenarios), len(components)
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(6*ncols, 4*nrows), dpi=300,
+        subplot_kw={"projection": ccrs.Robinson()},
+        gridspec_kw={"hspace":-0.08, "wspace":0.03},
+    )
+    axes = np.array(axes).reshape(nrows, ncols)
+    norm = TwoSlopeNorm(vcenter=0, vmin=-vlim, vmax=vlim)
+
+    for r, sc in enumerate(scenarios):
+        for c, comp in enumerate(components):
+            ax = axes[r, c]
+            add_map_background(ax, white=True)
+            d        = table[(table["scenario"]==sc)&(table["component"]==comp)][["biome_realm",value_col]]
+            plot_gdf = gdf.merge(d, on="biome_realm", how="left")
+            plot_gdf.plot(column=value_col, ax=ax, transform=ccrs.PlateCarree(),
+                          cmap=CMAP_DIVERGING, norm=norm, linewidth=0.0,
+                          missing_kwds={"color":"white"}, zorder=2)
+            if r == 0:
+                ax.set_title(COMP_LABELS.get(comp, comp),
+                             fontsize=FS["title"], fontweight="bold", pad=6)
+            if c == 0:
+                ax.text(-0.06, 0.5, SCEN_LABEL[sc], transform=ax.transAxes,
+                        rotation=90, va="center", ha="right",
+                        fontsize=FS["axis"], fontweight="bold")
+
+    cax = fig.add_axes([0.20, 0.03, 0.60, 0.012])
+    sm  = plt.cm.ScalarMappable(norm=norm, cmap=CMAP_DIVERGING)
+    sm.set_array([])
+    cb  = fig.colorbar(sm, cax=cax, orientation="horizontal", extend="both")
+    cb.set_label("Change in GDW area (km2)", fontsize=FS["axis"])
+    cb.ax.tick_params(labelsize=FS["tick"])
+    cb.outline.set_linewidth(0.8)
+
+    fig.savefig(OUT / "S3_biome_realm_absolute_change.png", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "S3_biome_realm_absolute_change.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(OUT / "S3_biome_realm_absolute_change.svg", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log("Saved: S3_biome_realm_absolute_change.png")
+
+# =============================================================================
+# S4
+# =============================================================================
+
+def make_s4_continent_gdw_table():
+    log("Building S4: continent GDW area table")
+
+    df = annual_realm_from_parquet([COL_TOTAL, COL_NONLU], keep_gcm=False)
+
+    rows = []
+    for sc in SCENARIOS:
+        lo, hi = HIST_LAST if sc == "historical" else FUT_LAST
+        d = df[df["scenario"].eq(sc) & df["year"].between(lo, hi)]
+        m = d.groupby("realm", as_index=False)[[COL_TOTAL, COL_NONLU]].mean()
+        m["scenario"] = sc
+        m["period"]   = f"{lo}-{hi}"
+        rows.append(m)
+
+    tab = pd.concat(rows, ignore_index=True)
+    tab["continent"] = tab["realm"].map(REALM_TO_CONTINENT)
+
+    tab["total_gdw_1000km2"] = tab[COL_TOTAL] / 1e3
+    tab["nonlu_gdw_1000km2"] = tab[COL_NONLU] / 1e3
+
+    cont = (
+        tab.groupby(["scenario","period","continent"], as_index=False)
+        [["total_gdw_1000km2","nonlu_gdw_1000km2"]]
+        .sum()
+    )
+
+    global_rows = []
+    for (sc, per), g in cont.groupby(["scenario","period"]):
+        global_rows.append({
+            "scenario":           sc,
+            "period":             per,
+            "continent":          "Global",
+            "total_gdw_1000km2":  g["total_gdw_1000km2"].sum(),
+            "nonlu_gdw_1000km2":  g["nonlu_gdw_1000km2"].sum(),
+        })
+    cont = pd.concat([cont, pd.DataFrame(global_rows)], ignore_index=True)
+    cont["total_gdw_1000km2"] = cont["total_gdw_1000km2"].round(1)
+    cont["nonlu_gdw_1000km2"] = cont["nonlu_gdw_1000km2"].round(1)
+    cont = cont.rename(columns={
+        "total_gdw_1000km2": "Total GDW area (thousand km2)",
+        "nonlu_gdw_1000km2": "GDW without landuse impact (thousand km2)",
+    })
+
+    cont_order = [
+        "North America","South America","Africa",
+        "Europe & Asia","Asia (Indo-Malayan)","Oceania","Global",
+    ]
+    cont["continent"] = pd.Categorical(cont["continent"],
+                                        categories=cont_order, ordered=True)
+    cont = cont.sort_values(["scenario","continent"]).reset_index(drop=True)
+
+    out_csv = OUT / "S4_continent_gdw_area_table.csv"
+    cont.to_csv(out_csv, index=False)
+    log(f"Saved: {out_csv}")
+
+    hist = cont[cont["scenario"]=="historical"][
+        ["continent","period",
+         "Total GDW area (thousand km2)",
+         "GDW without landuse impact (thousand km2)"]
+    ]
+    log("\nHistorical GDW area by continent (2005-2014):")
+    log(hist.to_string(index=False))
+
+    return cont
+
+# =============================================================================
+# S5 - Per-pixel GCM standard deviation of area change (companion to Fig 1a)
+# =============================================================================
+
+def plot_s5_pixel_gcm_uncertainty(sc="ssp370", var=PIXEL_VAR):
+    log(f"Building S5: per-pixel GCM uncertainty ({sc} vs historical)")
+
+    hist_ens = open_timmean_da("historical", var)
+    fut_ens  = open_timmean_da(sc, var)
+    mean_diff = (fut_ens - hist_ens).where(hist_ens >= BASELINE_MIN)
+    lat, lon = hist_ens["lat"].values, hist_ens["lon"].values
+
+    per_gcm_diffs = []
+    used_gcms = []
+    for gcm in GCMS:
+        h = open_timmean_da_gcm(gcm, "historical", var)
+        f = open_timmean_da_gcm(gcm, sc, var)
+        if h is None or f is None:
+            continue
+        try:
+            d = (f - h).where(h >= BASELINE_MIN)
+            per_gcm_diffs.append(d)
+            used_gcms.append(gcm)
+        except Exception as e:
+            log(f"[warn] could not difference {gcm}: {e}")
+
+    if len(per_gcm_diffs) < 2:
+        log(f"[warn] S5 skipped: only {len(per_gcm_diffs)} per-GCM timmean file(s) found "
+            f"(need >=2). Run generate_gcm_timmean.py, or verify timmean_path_gcm() "
+            f"naming against the actual files under {GCMS_BASE}.")
+        return None
+
+    log(f"[S5] using GCMs: {used_gcms}")
+    stacked = xr.concat(per_gcm_diffs, dim="gcm")
+    std_np  = stacked.std("gcm", skipna=True).compute().values.astype("float32")
+    mean_np = mean_diff.compute().values.astype("float32")
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(20, 7), dpi=300,
+        subplot_kw={"projection": ccrs.Robinson()},
+        gridspec_kw={"wspace": 0.05},
+    )
+
+    add_map_background(axes[0], white=True)
+    pm0 = axes[0].pcolormesh(lon, lat, np.ma.masked_invalid(mean_np),
+                              transform=ccrs.PlateCarree(), cmap=_RDGREY_BU,
+                              norm=TwoSlopeNorm(vcenter=0, vmin=-8, vmax=8),
+                              shading="auto", rasterized=True, zorder=2)
+    axes[0].text(0.01, 0.97, "(a) Ensemble mean", transform=axes[0].transAxes,
+                 fontsize=FS["panel"]*0.7, fontweight="bold", va="top")
+    cb0 = fig.colorbar(pm0, ax=axes[0], orientation="horizontal", pad=0.04, shrink=0.85, extend="both")
+    cb0.set_label("Area change (km$^2$)", fontsize=FS["small"])
+    cb0.ax.tick_params(labelsize=FS["small"])
+
+    add_map_background(axes[1], white=True)
+    vmax_std = float(np.nanpercentile(std_np[np.isfinite(std_np)], 95)) if np.isfinite(std_np).any() else 1.0
+    pm1 = axes[1].pcolormesh(lon, lat, np.ma.masked_invalid(std_np),
+                              transform=ccrs.PlateCarree(), cmap="magma_r",
+                              vmin=0, vmax=vmax_std,
+                              shading="auto", rasterized=True, zorder=2)
+    axes[1].text(0.01, 0.97, f"(b) GCM std. dev. (n={len(used_gcms)})",
+                 transform=axes[1].transAxes,
+                 fontsize=FS["panel"]*0.7, fontweight="bold", va="top")
+    cb1 = fig.colorbar(pm1, ax=axes[1], orientation="horizontal", pad=0.04, shrink=0.85, extend="max")
+    cb1.set_label("Std. dev. across GCMs (km$^2$)", fontsize=FS["small"])
+    cb1.ax.tick_params(labelsize=FS["small"])
+
+    out_path = OUT / f"S5_pixel_gcm_uncertainty_{sc}.png"
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".svg"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log(f"Saved: {out_path}")
+    return out_path
+
+# =============================================================================
+# S8 - Per biome-realm, number of GCMs agreeing on sign (companion to Fig 4)
+# =============================================================================
+
+def plot_s8_gcm_agreement_maps(component_col=COL_TOTAL):
+    log("Building S8: per-model (GCM) agreement count map")
+
+    per_gcm = compute_biome_realm_pcr_table_per_gcm(component_col=component_col)
+    agree   = compute_agreement_table(per_gcm)
+    gdf     = load_biome_realm_gdf()
+
+    fig, axes = plt.subplots(
+        1, len(SCENARIOS), figsize=(6*len(SCENARIOS), 4), dpi=300,
+        subplot_kw={"projection": ccrs.Robinson()},
+        gridspec_kw={"wspace": 0.03},
+    )
+
+    # With N=5 GCMs, a majority can never be below 3/5, so only 3, 4, 5
+    # are achievable. Using the full 0-5 range wastes half the palette on
+    # impossible values and compresses the visible contrast.
+    AGREE_COLORS = {3:"#E5F5E0", 4:"#74C476", 5:"#00441B"}
+    cmap, norm = discrete_cmap_norm(AGREE_COLORS)
+
+    for ax, sc in zip(axes, SCENARIOS):
+        add_map_background(ax, white=True)
+        d = agree[agree["scenario"]==sc][["biome_realm","n_agree"]]
+        plot_gdf = gdf.merge(d, on="biome_realm", how="left")
+        plot_gdf.plot(column="n_agree", ax=ax, transform=ccrs.PlateCarree(),
+                      cmap=cmap, norm=norm, linewidth=0.0,
+                      missing_kwds={"color":"white"}, zorder=2)
+        ax.set_title(SCEN_LABEL[sc], fontsize=FS["title"], fontweight="bold")
+
+    handles = [Patch(facecolor=AGREE_COLORS[k], edgecolor="0.4", label=f"{k}/5 agree")
+               for k in sorted(AGREE_COLORS)]
+    fig.legend(handles=handles, ncol=3, loc="lower center", bbox_to_anchor=(0.5, -0.05),
+               frameon=False, fontsize=FS["legend"])
+
+    out_path = OUT / "S8_gcm_agreement_count_map.png"
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".svg"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log(f"Saved: {out_path}")
+    return out_path
+
+# =============================================================================
+# S9 - GCM-resolved version of Fig 1b / 1d
+# =============================================================================
+
+def plot_s9_figure1_gcm_resolved():
+    log("Building S9: GCM-resolved Figure 1b/1d")
+
+    gcm_gl = compute_panel_b_gain_loss()
+
+    # Right panel now uses the per-GCM driver breakdown (S12's data source)
+    # instead of the ensemble-only pixel CSV, so GCM spread is actually
+    # visible here. Note this panel is therefore the realm-level
+    # approximation (see compute_panel_d_driver_breakdown_per_gcm
+    # docstring), not the exact pixel-based classification shown in the
+    # main Fig 1d -- the two will not have identical percentages.
+    driver_gcm = compute_panel_d_driver_breakdown_per_gcm()
+
+    SCEN_ORDER  = ["ssp126","ssp370","ssp585"]
+    SCEN_LABELS = {"ssp126":"SSP1-2.6","ssp370":"SSP3-7.0","ssp585":"SSP5-8.5"}
+
+    fig, (ax_b, ax_d) = plt.subplots(1, 2, figsize=(24, 8), dpi=300)
+
+    x_ins = np.arange(len(SCEN_ORDER))
+    LOSS_COL, GAIN_COL = "#B2182B", "#2166AC"
+    for i, sc in enumerate(SCEN_ORDER):
+        sub = gcm_gl[gcm_gl["scenario"]==sc]
+        ax_b.plot(np.full(len(sub), x_ins[i]-0.12), -sub["loss_1e3km2"], "o",
+                  color=LOSS_COL, alpha=0.7, ms=8)
+        ax_b.plot(np.full(len(sub), x_ins[i]+0.12), sub["gain_1e3km2"], "o",
+                  color=GAIN_COL, alpha=0.7, ms=8)
+        if not sub.empty:
+            ax_b.errorbar(x_ins[i]-0.12, -sub["loss_1e3km2"].mean(),
+                          yerr=sub["loss_1e3km2"].std(), fmt="s", color="black", ms=10, capsize=6)
+            ax_b.errorbar(x_ins[i]+0.12, sub["gain_1e3km2"].mean(),
+                          yerr=sub["gain_1e3km2"].std(), fmt="s", color="black", ms=10, capsize=6)
+    ax_b.axhline(0, color="0.3", lw=1.5)
+    ax_b.set_xticks(x_ins)
+    ax_b.set_xticklabels([SCEN_LABELS[s] for s in SCEN_ORDER], fontsize=FS["tick"], fontweight="bold")
+    ax_b.set_ylabel(r"Area change ($10^3$ km$^2$)", fontsize=FS["axis"])
+    ax_b.set_title("Gain/loss, per GCM (dots) with ensemble mean +/- std (squares)", fontsize=FS["title"])
+    ax_b.grid(axis="y", alpha=0.2)
+    for sp in ("top","right"): ax_b.spines[sp].set_visible(False)
+
+    # No "Mixed" class in the realm-level approximation (only 6 realms, so
+    # groundwater-vs-landuse ties are rare and not separately tracked).
+    LOSS_CLASSES = ["Groundwater driven loss", "Land-use driven loss"]
+    GAIN_CLASSES = ["Groundwater driven gain", "Land-use driven gain"]
+    LOSS_COLORS  = ["#08306B", "#7F2704"]
+    GAIN_COLORS  = ["#6BAED6", "#FDAE6B"]
+    y_pos = np.arange(len(SCEN_ORDER))
+    bar_h = 0.16
+    offsets = [-0.5, 0.5]
+
+    if driver_gcm.empty:
+        log("[warn] S9 right panel: no per-GCM driver data, leaving panel blank")
+    else:
+        max_val = 0.0
+        for sc in SCEN_ORDER:
+            d = driver_gcm[driver_gcm["scenario"] == sc]
+            for cls in LOSS_CLASSES + GAIN_CLASSES:
+                sub = d[d["class"] == cls]["area_fraction_pct"]
+                if not sub.empty:
+                    max_val = max(max_val, float(sub.mean()) + float(sub.std() or 0))
+        ax_d.set_xlim(-(max_val + 12), max_val + 12)
+
+        for i, sc in enumerate(SCEN_ORDER):
+            d = driver_gcm[driver_gcm["scenario"] == sc]
+            for off, cls, col in zip(offsets, LOSS_CLASSES, LOSS_COLORS):
+                sub = d[d["class"] == cls]["area_fraction_pct"]
+                val = float(sub.mean()) if not sub.empty else 0.0
+                err = float(sub.std()) if len(sub) > 1 else 0.0
+                y = y_pos[i] + off * bar_h * 1.4
+                ax_d.barh(y, -val, height=bar_h, color=col, edgecolor="white", linewidth=1.0)
+                if err > 0:
+                    ax_d.errorbar(-val, y, xerr=err, fmt="none", ecolor="black",
+                                  elinewidth=1.6, capsize=4, zorder=5)
+                ax_d.text(-val - err - 2.0, y, f"{val:.0f}%", ha="right", va="center",
+                          fontsize=FS["small"], color=col, fontweight="bold")
+            for off, cls, col in zip(offsets, GAIN_CLASSES, GAIN_COLORS):
+                sub = d[d["class"] == cls]["area_fraction_pct"]
+                val = float(sub.mean()) if not sub.empty else 0.0
+                err = float(sub.std()) if len(sub) > 1 else 0.0
+                y = y_pos[i] + off * bar_h * 1.4
+                ax_d.barh(y, val, height=bar_h, color=col, edgecolor="white", linewidth=1.0)
+                if err > 0:
+                    ax_d.errorbar(val, y, xerr=err, fmt="none", ecolor="black",
+                                  elinewidth=1.6, capsize=4, zorder=5)
+                ax_d.text(val + err + 2.0, y, f"{val:.0f}%", ha="left", va="center",
+                          fontsize=FS["small"], color=col, fontweight="bold")
+
+    ax_d.axvline(0, color="0.25", lw=1.5)
+    ax_d.set_yticks(y_pos)
+    ax_d.set_yticklabels([SCEN_LABELS[s] for s in SCEN_ORDER], fontsize=FS["tick"], fontweight="bold")
+    ax_d.set_xlabel("% GDW area (realm-level approximation)", fontsize=FS["axis"])
+    ax_d.set_title("Driver classes, per-GCM mean +/- std\n(6-realm approximation, no Mixed class)",
+                   fontsize=FS["title"])
+    ax_d.grid(axis="x", alpha=0.2)
+    for sp in ("top","right"): ax_d.spines[sp].set_visible(False)
+
+    fig.tight_layout()
+    out_path = OUT / "S9_figure1_gcm_resolved.png"
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+    fig.savefig(out_path.with_suffix(".svg"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log(f"Saved: {out_path}")
+    return out_path
+
+# =============================================================================
+# S10 -- REBUILT: per-GCM, per-biome-realm area table.
+# Columns: GCM, scenario, period, biome_realm, total_gdw_km2 (landuse
+# included), nonlu_gdw_km2 (landuse excluded). This is the individual-model
+# breakdown behind Figure 3 and Figure 4, at the finer biome-realm
+# resolution rather than the continent aggregation in S4.
+# =============================================================================
+
+def make_s10_per_gcm_biome_realm_area_table():
+    log("Building S10: per-GCM, per-biome-realm area table "
+        "(total GDW vs. GDW without landuse impact)")
+
+    cols = [COL_TOTAL, COL_NONLU]
+    df = annual_biome_realm_from_parquet(cols, keep_gcm=True)
+
+    rows = []
+    for sc in SCENARIOS:
+        lo, hi = HIST_LAST if sc == "historical" else FUT_LAST
+        d = df[df["scenario"].eq(sc) & df["year"].between(lo, hi)]
+        m = d.groupby(["source","biome_realm"], as_index=False)[cols].mean()
+        m["scenario"] = sc
+        m["period"]   = f"{lo}-{hi}"
+        rows.append(m)
+
+    tab = pd.concat(rows, ignore_index=True)
+    tab = tab.rename(columns={
+        "source": "GCM",
+        COL_TOTAL: "total_gdw_km2",
+        COL_NONLU: "nonlu_gdw_km2",
+    })
+    tab["total_gdw_km2"] = tab["total_gdw_km2"].round(1)
+    tab["nonlu_gdw_km2"] = tab["nonlu_gdw_km2"].round(1)
+    tab = tab[["scenario","period","biome_realm","GCM","total_gdw_km2","nonlu_gdw_km2"]]
+    tab = tab.sort_values(["scenario","biome_realm","GCM"]).reset_index(drop=True)
+
+    out_csv = OUT / "S10_per_gcm_biome_realm_area_table.csv"
+    tab.to_csv(out_csv, index=False)
+    log(f"Saved: {out_csv}")
+
+    # Compact per-scenario, per-GCM global roll-up (sum across all
+    # biome-realms), useful as a quick sanity check against S4/S10.
+    glob = (
+        tab.groupby(["scenario","period","GCM"], as_index=False)
+        [["total_gdw_km2","nonlu_gdw_km2"]].sum()
+    )
+    glob["total_gdw_1000km2"] = (glob["total_gdw_km2"] / 1e3).round(1)
+    glob["nonlu_gdw_1000km2"] = (glob["nonlu_gdw_km2"] / 1e3).round(1)
+    out_glob = OUT / "S10b_per_gcm_global_rollup.csv"
+    glob[["scenario","period","GCM","total_gdw_1000km2","nonlu_gdw_1000km2"]].to_csv(
+        out_glob, index=False)
+    log(f"Saved: {out_glob}")
+
+    return tab, glob
+
+# =============================================================================
+# S12 - Per-GCM driver-class breakdown (realm-level approximation of Fig 1d)
+# =============================================================================
+
+def make_s12_panel_d_driver_breakdown_per_gcm():
+    log("Building S12: per-GCM driver-class breakdown (realm-level approximation of Fig 1d)")
+    tab = compute_panel_d_driver_breakdown_per_gcm()
+    if tab.empty:
+        log("[warn] S12: no data computed, skipping save")
+        return tab
+    tab["area_fraction_pct"] = tab["area_fraction_pct"].round(1)
+    tab = tab.sort_values(["scenario","GCM","class"]).reset_index(drop=True)
+    out_csv = OUT / "S12_panel_d_driver_breakdown_per_gcm.csv"
+    tab.to_csv(out_csv, index=False)
+    log(f"Saved: {out_csv}")
+    log("NOTE: this is a 6-realm approximation, not the pixel-based classification "
+        "used in the main Fig 1d -- see compute_panel_d_driver_breakdown_per_gcm() docstring.")
+    return tab
+
+# =============================================================================
+# MONTHLY CLIMATOLOGY CHANGE ANIMATION
+# =============================================================================
+
+def plot_monthly_climatology_change_animation(
+    sc="ssp370",
+    var=COL_TOTAL,
+    baseline_sc="historical",
+    out_name=None,
+    fps=1.2,
+    save_mp4=False,
+):
+    log("=" * 90)
+    log(f"[monthly-animation] Scenario: {sc}")
+    log(f"[monthly-animation] Variable: {var}")
+    log(f"[monthly-animation] Baseline: {baseline_sc}")
+    log(f"[monthly-animation] BASELINE_MIN: {BASELINE_MIN}")
+    log(f"[monthly-animation] Output directory: {OUT}")
+
+    HOTSPOTS = {
+        "Central Valley": [-123, -118, 34, 40],
+        "North India": [72, 82, 24, 33],
+        "North China Plain": [112, 121, 33, 40],
+        "Sahel": [-18, 35, 10, 18],
+    }
+
+    log("[monthly-animation] Opening monthly climatology datasets")
+    hist = open_monthly_clim_da(baseline_sc, var).sortby("month")
+    fut  = open_monthly_clim_da(sc,          var).sortby("month")
+
+    log("[monthly-animation] Aligning grids and months")
+    hist, fut = xr.align(hist, fut, join="inner")
+
+    hist_active = hist >= BASELINE_MIN
+    fut_active  = fut  >= BASELINE_MIN
+
+    change = (fut - hist).where(hist_active | fut_active)
+
+    total_loss = hist_active & (~fut_active)
+    first_loss_month = total_loss.idxmax("month").where(total_loss.any("month"))
+
+    log("[monthly-animation] Computing robust color scale")
+    vals = change.compute().values.astype("float32")
+    finite_vals = vals[np.isfinite(vals)]
+
+    vmax = float(np.nanpercentile(np.abs(finite_vals), 98)) if finite_vals.size else 1.0
+    vmax = max(vmax, 1.0)
+
+    log(f"[monthly-animation] Color scale: {-vmax:.2f} to +{vmax:.2f} km2 per cell")
+
+    lat = change["lat"].values
+    lon = change["lon"].values
+    months = [int(m) for m in change["month"].values]
+
+    log(f"[monthly-animation] Months found: {months}")
+
+    log("[monthly-animation] Computing global monthly totals")
+    monthly_net = (
+        change.sum(("lat", "lon"), skipna=True)
+        .compute()
+        .values
+        .astype("float64")
+    )
+    monthly_gain = (
+        change.where(change > 0)
+        .sum(("lat", "lon"), skipna=True)
+        .compute()
+        .values
+        .astype("float64")
+    )
+    monthly_loss = (
+        change.where(change < 0)
+        .sum(("lat", "lon"), skipna=True)
+        .compute()
+        .values
+        .astype("float64")
+    )
+
+    net_k = monthly_net / 1e3
+    gain_k = monthly_gain / 1e3
+    loss_k = monthly_loss / 1e3
+
+    ymax = np.nanmax([
+        np.nanmax(np.abs(net_k)),
+        np.nanmax(np.abs(gain_k)),
+        np.nanmax(np.abs(loss_k)),
+    ])
+    ymax = max(float(ymax) * 1.20, 1.0)
+
+    log(f"[monthly-animation] Time-series y-limit: +/-{ymax:.1f} thousand km2")
+
+    log("[monthly-animation] Initializing figure")
+    fig = plt.figure(figsize=(34, 13), dpi=220)
+    fig.patch.set_alpha(0.0)
+
+    gs = GridSpec(
+        4, 4,
+        width_ratios=[1.30, 4.20, 0.12, 1.85],
+        height_ratios=[0.70, 1, 1, 1],
+        wspace=0.035,
+        hspace=0.10,
+    )
+
+    ax_insets = [
+        fig.add_subplot(gs[i, 0], projection=ccrs.PlateCarree())
+        for i in range(4)
+    ]
+
+    ax = fig.add_subplot(gs[:, 1], projection=ccrs.Robinson())
+    stats_ax = fig.add_subplot(gs[0, 3])
+    ax_side = fig.add_subplot(gs[1:, 3])
+
+    stats_ax.axis("off")
+    stats_ax.patch.set_alpha(0.0)
+
+    def style_map_axis(a, extent=None, global_map=False, inset=False):
+        a.patch.set_alpha(0.0)
+
+        if global_map:
+            a.set_global()
+            a.set_extent([-180, 180, -58, 90], crs=ccrs.PlateCarree())
+        else:
+            a.set_extent(extent, crs=ccrs.PlateCarree())
+
+        a.coastlines(
+            linewidth=1.6 if not inset else 1.2,
+            color="0.30",
+            zorder=8,
+        )
+        a.add_feature(
+            cfeature.BORDERS.with_scale("110m"),
+            linewidth=0.55 if not inset else 0.40,
+            edgecolor="0.58",
+            zorder=8,
+        )
+        a.axis("off")
+
+    style_map_axis(ax, global_map=True)
+
+    norm = TwoSlopeNorm(vcenter=0, vmin=-vmax, vmax=vmax)
+
+    first_month = months[0]
+    first_change = change.sel(month=first_month).compute().values.astype("float32")
+
+    prev_lost0 = (
+        np.isfinite(first_loss_month)
+        &
+        (first_loss_month < first_month)
+    ).compute().values.astype(bool)
+
+    new_lost0 = (
+        first_loss_month == first_month
+    ).compute().values.astype(bool)
+
+    log("[monthly-animation] Drawing global map layers")
+    pm = ax.pcolormesh(
+        lon, lat,
+        np.ma.masked_invalid(first_change),
+        transform=ccrs.PlateCarree(),
+        cmap=_RDGREY_BU,
+        norm=norm,
+        shading="auto",
+        rasterized=True,
+        zorder=2,
+    )
+
+    prev_loss_layer = ax.pcolormesh(
+        lon, lat,
+        np.ma.masked_where(~prev_lost0, prev_lost0.astype("float32")),
+        transform=ccrs.PlateCarree(),
+        cmap=ListedColormap(["#6b6b6b"]),
+        shading="auto",
+        rasterized=True,
+        alpha=0.45,
+        zorder=4,
+    )
+
+    new_loss_layer = ax.pcolormesh(
+        lon, lat,
+        np.ma.masked_where(~new_lost0, new_lost0.astype("float32")),
+        transform=ccrs.PlateCarree(),
+        cmap=ListedColormap(["black"]),
+        shading="auto",
+        rasterized=True,
+        alpha=0.98,
+        zorder=5,
+    )
+
+    log("[monthly-animation] Drawing hotspot boxes on global map")
+    for name, (xmin, xmax, ymin, ymax_) in HOTSPOTS.items():
+        ax.add_patch(
+            Rectangle(
+                (xmin, ymin),
+                xmax - xmin,
+                ymax_ - ymin,
+                transform=ccrs.PlateCarree(),
+                fill=False,
+                edgecolor="black",
+                linewidth=2.8,
+                zorder=9,
+            )
+        )
+
+    cb = fig.colorbar(
+        pm,
+        ax=ax,
+        orientation="horizontal",
+        pad=0.035,
+        shrink=0.76,
+        extend="both",
+    )
+    cb.set_label("Change in GDW area per cell (km$^2$)", fontsize=28)
+    cb.ax.tick_params(labelsize=24, length=8, width=1.6)
+    cb.outline.set_linewidth(1.6)
+    cb.ax.set_facecolor("none")
+
+    ax.legend(
+        handles=[
+            Patch(facecolor="black", edgecolor="black", label="New disappearance"),
+            Patch(facecolor="#6b6b6b", edgecolor="#6b6b6b", alpha=0.55, label="Earlier disappearance"),
+        ],
+        loc="lower left",
+        frameon=True,
+        framealpha=0.92,
+        fontsize=22,
+    )
+
+    log("[monthly-animation] Drawing hotspot inset panels")
+    inset_artists = []
+
+    for inset_ax, (name, extent) in zip(ax_insets, HOTSPOTS.items()):
+        xmin, xmax, ymin, ymax_ = extent
+        pad_x = (xmax - xmin) * 0.08
+        pad_y = (ymax_ - ymin) * 0.08
+        ex = [xmin - pad_x, xmax + pad_x, ymin - pad_y, ymax_ + pad_y]
+
+        style_map_axis(inset_ax, extent=ex, global_map=False, inset=True)
+
+        pm_i = inset_ax.pcolormesh(
+            lon, lat,
+            np.ma.masked_invalid(first_change),
+            transform=ccrs.PlateCarree(),
+            cmap=_RDGREY_BU,
+            norm=norm,
+            shading="auto",
+            rasterized=True,
+            zorder=2,
+        )
+
+        prev_i = inset_ax.pcolormesh(
+            lon, lat,
+            np.ma.masked_where(~prev_lost0, prev_lost0.astype("float32")),
+            transform=ccrs.PlateCarree(),
+            cmap=ListedColormap(["#6b6b6b"]),
+            shading="auto",
+            rasterized=True,
+            alpha=0.45,
+            zorder=4,
+        )
+
+        new_i = inset_ax.pcolormesh(
+            lon, lat,
+            np.ma.masked_where(~new_lost0, new_lost0.astype("float32")),
+            transform=ccrs.PlateCarree(),
+            cmap=ListedColormap(["black"]),
+            shading="auto",
+            rasterized=True,
+            alpha=0.98,
+            zorder=5,
+        )
+
+        inset_ax.text(
+            0.03, 0.95,
+            name,
+            transform=inset_ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=22,
+            fontweight="bold",
+            bbox=dict(
+                facecolor="white",
+                edgecolor="none",
+                alpha=0.90,
+                pad=4.5,
+            ),
+            zorder=10,
+        )
+
+        inset_artists.append((pm_i, prev_i, new_i))
+
+    log("[monthly-animation] Creating time-series panel")
+    x = np.arange(1, len(months) + 1)
+    xlabels = [MONTH_NAMES[m - 1] for m in months]
+
+    ax_side.patch.set_alpha(0.0)
+
+    net_line, = ax_side.plot([], [], lw=6.0, label="Net")
+    gain_line, = ax_side.plot([], [], lw=6.0, label="Gain")
+    loss_line, = ax_side.plot([], [], lw=6.0, label="Loss")
+
+    for line in [net_line, gain_line, loss_line]:
+        line.set_path_effects([
+            patheffects.Stroke(linewidth=12.0, foreground="white"),
+            patheffects.Normal(),
+        ])
+
+    net_point, = ax_side.plot([], [], "o", ms=16)
+    gain_point, = ax_side.plot([], [], "o", ms=16)
+    loss_point, = ax_side.plot([], [], "o", ms=16)
+
+    ax_side.axhline(0, color="0.25", lw=2.2)
+    ax_side.set_xlim(0.7, len(months) + 0.3)
+    ax_side.set_ylim(-ymax, ymax)
+    ax_side.set_xticks(x)
+    ax_side.set_xticklabels(xlabels, rotation=45, ha="right", fontsize=22)
+    ax_side.set_ylabel(r"Monthly area change ($10^3$ km$^2$)", fontsize=26)
+    ax_side.grid(axis="y", alpha=0.18, linewidth=1.8)
+    ax_side.grid(axis="x", visible=False)
+
+    for sp in ("top", "right"):
+        ax_side.spines[sp].set_visible(False)
+    for sp in ("left", "bottom"):
+        ax_side.spines[sp].set_linewidth(2.4)
+        ax_side.spines[sp].set_color("0.25")
+
+    ax_side.tick_params(axis="y", labelsize=22, width=2.0, length=7)
+
+    ax_side.legend(
+        frameon=False,
+        fontsize=24,
+        loc="upper left",
+        handlelength=2.2,
+    )
+
+    stats_text = stats_ax.text(
+        0.02, 0.96,
+        "",
+        transform=stats_ax.transAxes,
+        fontsize=30,
+        fontweight="bold",
+        va="top",
+        ha="left",
+        linespacing=1.28,
+        bbox=dict(
+            facecolor="white",
+            edgecolor="0.80",
+            boxstyle="round,pad=0.55",
+            alpha=0.95,
+        ),
+    )
+
+    log("[monthly-animation] Initializing animation update function")
+
+    def update(frame_idx):
+        month = months[frame_idx]
+        month_label = MONTH_NAMES[month - 1]
+        xx = x[:frame_idx + 1]
+
+        arr = change.sel(month=month).compute().values.astype("float32")
+
+        prev_lost = (
+            np.isfinite(first_loss_month)
+            &
+            (first_loss_month < month)
+        ).compute().values.astype(bool)
+
+        new_lost = (
+            first_loss_month == month
+        ).compute().values.astype(bool)
+
+        arr_masked = np.ma.masked_invalid(arr)
+        prev_masked = np.ma.masked_where(~prev_lost, prev_lost.astype("float32"))
+        new_masked = np.ma.masked_where(~new_lost, new_lost.astype("float32"))
+
+        pm.set_array(arr_masked.ravel())
+        prev_loss_layer.set_array(prev_masked.ravel())
+        new_loss_layer.set_array(new_masked.ravel())
+
+        for pm_i, prev_i, new_i in inset_artists:
+            pm_i.set_array(arr_masked.ravel())
+            prev_i.set_array(prev_masked.ravel())
+            new_i.set_array(new_masked.ravel())
+
+        net_line.set_data(xx, net_k[:frame_idx + 1])
+        gain_line.set_data(xx, gain_k[:frame_idx + 1])
+        loss_line.set_data(xx, loss_k[:frame_idx + 1])
+
+        net_point.set_data([frame_idx + 1], [net_k[frame_idx]])
+        gain_point.set_data([frame_idx + 1], [gain_k[frame_idx]])
+        loss_point.set_data([frame_idx + 1], [loss_k[frame_idx]])
+
+        stats_text.set_text(
+            f"{month_label}\n"
+            f"Net   {net_k[frame_idx]:+.1f}\n"
+            f"Gain  {gain_k[frame_idx]:+.1f}\n"
+            f"Loss  {loss_k[frame_idx]:+.1f}"
+        )
+
+        return (
+            pm,
+            prev_loss_layer,
+            new_loss_layer,
+            *[a for trio in inset_artists for a in trio],
+            net_line,
+            gain_line,
+            loss_line,
+            net_point,
+            gain_point,
+            loss_point,
+            stats_text,
+        )
+
+    update(0)
+
+    log("[monthly-animation] Creating FuncAnimation object")
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=len(months),
+        interval=900,
+        blit=False,
+    )
+
+    if out_name is None:
+        suffix = "mp4" if save_mp4 else "gif"
+        out_name = OUT / f"monthly_climatology_presentation_{sc}.{suffix}"
+
+    out_name = Path(out_name)
+    out_name.parent.mkdir(parents=True, exist_ok=True)
+
+    log(f"[monthly-animation] Saving animation: {out_name}")
+
+    if out_name.suffix.lower() == ".mp4":
+        anim.save(
+            out_name,
+            writer=FFMpegWriter(fps=fps, bitrate=4000),
+            savefig_kwargs={
+                "transparent": True,
+                "facecolor": "none",
+                "edgecolor": "none",
+            },
+        )
+    else:
+        anim.save(
+            out_name,
+            writer=PillowWriter(fps=fps),
+            savefig_kwargs={
+                "transparent": True,
+                "facecolor": "none",
+                "edgecolor": "none",
+            },
+        )
+
+    plt.close(fig)
+
+    log(f"[monthly-animation] Saved: {out_name}")
+    log("=" * 90)
+
+    return out_name
+
+
+# =============================================================================
+# FIGURE 6: percentage change with sign-disagreement hatching
+# =============================================================================
+
+def plot_figure6_biome_map_sign_disagreement():
+    """Figure 6: biome-realm percentage change with unanimous-sign test.
+
+    The colour field is identical to Figure 4: ensemble-mean percentage
+    change relative to the relevant baseline. A biome-realm is hatched when
+    the five GCMs do not unanimously agree on the sign of change, meaning at
+    least one GCM projects an increase and at least one projects a decrease.
+
+    Zero-valued model changes are treated as neutral. A unit is hatched when
+    both a positive and a negative model response are present. All five GCMs
+    must be available for the unit to be classified.
+    """
+    log("Building Figure 6: percentage change with sign-disagreement hatching")
+
+    table = compute_biome_realm_pcr_table()
+    gdf = load_biome_realm_gdf_checked(table)
+    value_col = "normalized_change_pct"
+    components = list(PCR_COLS_NORM.keys())
+    scenarios = SCENARIOS
+
+    comp_labels = {
+        "Groundwater Impact Only": "Groundwater only",
+        "Land-use Impact Only": "Land-use only",
+        "Groundwater + Land-use Impact": "Combined",
+    }
+
+    agreement_by_component = {}
+    records = []
+
+    for comp, col in PCR_COLS.items():
+        per = compute_biome_realm_pcr_table_per_gcm(component_col=col)
+
+        counts = per.groupby("scenario")["source"].nunique()
+        if any(counts.get(sc, 0) != len(GCMS) for sc in scenarios):
+            raise RuntimeError(
+                f"Figure 6 {comp} lacks GCMs: {counts.to_dict()}"
+            )
+
+        rows = []
+        for (sc, br), group in per.groupby(["scenario", "biome_realm"]):
+            vals = group["normalized_change_pct"].dropna()
+            n_gcm = int(group["source"].nunique())
+            n_positive = int((vals > 0).sum())
+            n_negative = int((vals < 0).sum())
+            n_zero = int((vals == 0).sum())
+            sign_disagreement = n_positive > 0 and n_negative > 0
+
+            rows.append({
+                "scenario": sc,
+                "biome_realm": br,
+                "component": comp,
+                "n_gcm": n_gcm,
+                "n_positive": n_positive,
+                "n_negative": n_negative,
+                "n_zero": n_zero,
+                "sign_disagreement": sign_disagreement,
+            })
+
+        agreement = pd.DataFrame(rows)
+        agreement_by_component[comp] = agreement
+        records.append(agreement)
+
+    agreement_full = pd.concat(records, ignore_index=True)
+    agreement_full.to_csv(
+        OUT / "figure6_biome_realm_sign_agreement.csv",
+        index=False,
+    )
+
+    nrows, ncols = len(scenarios), len(components)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(18, 16),
+        dpi=300,
+        subplot_kw={"projection": ccrs.Robinson()},
+        gridspec_kw={"hspace": -0.02, "wspace": 0.03},
+    )
+    axes = np.asarray(axes).reshape(nrows, ncols)
+    norm = TwoSlopeNorm(vcenter=0, vmin=-PCR_VLIM, vmax=PCR_VLIM)
+
+    for r, sc in enumerate(scenarios):
+        for c, comp in enumerate(components):
+            ax = axes[r, c]
+
+            add_map_background(
+                ax,
+                white=True,
+                coastline_width=0.55,
+                coastline_color="0.48",
+            )
+
+            change = table[
+                (table["scenario"] == sc)
+                & (table["component"] == comp)
+            ][["biome_realm", value_col]]
+
+            agreement = agreement_by_component[comp]
+            agreement = agreement[agreement["scenario"] == sc][
+                [
+                    "biome_realm",
+                    "n_gcm",
+                    "n_positive",
+                    "n_negative",
+                    "n_zero",
+                    "sign_disagreement",
+                ]
+            ]
+
+            plot_gdf = (
+                gdf.merge(change, on="biome_realm", how="left")
+                .merge(agreement, on="biome_realm", how="left")
+            )
+
+            plot_gdf.plot(
+                column=value_col,
+                ax=ax,
+                transform=ccrs.PlateCarree(),
+                cmap=CMAP_DIVERGING,
+                norm=norm,
+                linewidth=0,
+                missing_kwds={"color": "white"},
+                zorder=2,
+            )
+
+            uncertain = plot_gdf[
+                plot_gdf["sign_disagreement"].fillna(False)
+                & plot_gdf["n_gcm"].eq(len(GCMS))
+            ]
+
+            if not uncertain.empty:
+                ax.add_geometries(
+                    uncertain.geometry,
+                    crs=ccrs.PlateCarree(),
+                    facecolor="none",
+                    edgecolor="0.38",
+                    hatch="//",
+                    linewidth=0.20,
+                    zorder=6,
+                )
+
+            if r == 0:
+                ax.set_title(
+                    comp_labels[comp],
+                    fontsize=FS["title"],
+                    fontweight="bold",
+                )
+
+            if c == 0:
+                ax.text(
+                    -0.06,
+                    0.5,
+                    SCEN_LABEL[sc],
+                    transform=ax.transAxes,
+                    rotation=90,
+                    va="center",
+                    ha="right",
+                    fontsize=FS["axis"],
+                    fontweight="bold",
+                )
+
+    hatch_handle = Patch(
+        facecolor="white",
+        edgecolor="0.38",
+        hatch="//",
+        linewidth=0.6,
+        label="GCMs disagree on the sign of change",
+    )
+
+    fig.legend(
+        handles=[hatch_handle],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.062),
+        frameon=False,
+        fontsize=FS["legend"],
+        handlelength=2.2,
+        handleheight=1.1,
+    )
+
+    cax = fig.add_axes([0.20, 0.032, 0.60, 0.014])
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=CMAP_DIVERGING)
+    sm.set_array([])
+    cb = fig.colorbar(
+        sm,
+        cax=cax,
+        orientation="horizontal",
+        ticks=[-15, -10, -5, 0, 5, 10, 15],
+        extend="both",
+    )
+    cb.set_label(
+        "Change relative to the 2005–2014 baseline (%)",
+        fontsize=FS["axis"],
+    )
+    cb.ax.tick_params(labelsize=FS["tick"])
+    cb.outline.set_linewidth(0.8)
+
+    out_png = OUT / "figure6_biome_realm_pct_change_sign_disagreement.png"
+    fig.savefig(out_png, dpi=300, bbox_inches="tight")
+    fig.savefig(out_png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+    fig.savefig(out_png.with_suffix(".svg"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    log(f"Saved: {out_png}")
+
+    return agreement_full
+
+# =============================================================================
+# SUPPLEMENTARY MAIN
+# =============================================================================
+
+def run_supplementary():
+    log("Running supplementary figures and tables")
+    plot_s1_persistence_class()
+    plot_s2_persistence_change()
+    plot_s3_biome_realm_absolute()
+    make_s4_continent_gdw_table()
+    plot_s5_pixel_gcm_uncertainty(sc="ssp370")
+    plot_s8_gcm_agreement_maps()
+    plot_s9_figure1_gcm_resolved()
+    make_s10_per_gcm_biome_realm_area_table()
+    make_s12_panel_d_driver_breakdown_per_gcm()
+    log("Supplementary done.")
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate manuscript figures with five-GCM uncertainty."
+    )
+    parser.add_argument("--figures", nargs="+",
+                        choices=["1", "2", "3", "4", "5", "6", "supplementary", "all"],
+                        default=["all"])
+    parser.add_argument("--skip-unit-check", action="store_true",
+                        help="Skip the plausibility check for parquet area units.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    log(f"Output: {OUT}")
+    if not args.skip_unit_check:
+        validate_area_units()
+
+    requested = set(args.figures)
+    if "all" in requested:
+        requested = {"1", "2", "3", "4", "5", "6", "supplementary"}
+
+    if "1" in requested:
+        plot_figure1_four_panel()
+    if "2" in requested:
+        plot_realm_ts_only()
+    if "3" in requested:
+        plot_figure3_lollipop()
+    if "4" in requested:
+        plot_figure4_biome_map()
+    if "5" in requested:
+        plot_figure5_four_panel_net_only()
+    if "6" in requested:
+        plot_figure6_biome_map_sign_disagreement()
+    if "supplementary" in requested:
+        run_supplementary()
+
+    log("Done.")
+
+
+if __name__ == "__main__":
+    main()
