@@ -25,19 +25,19 @@ Outputs written to:
 Usage
 -----
   # all GCMs x SSPs
-  RUN_PROCESS_MODEL=1 python run_process_model.py
+  RUN_PROCESS_MODEL=1 python scripts/run_process_model.py
 
   # one GCM
-  RUN_PROCESS_MODEL=1 GCM=gfdl-esm4 python run_process_model.py
+  RUN_PROCESS_MODEL=1 GCM=gfdl-esm4 python scripts/run_process_model.py
 
   # one GCM x scenario
-  RUN_PROCESS_MODEL=1 GCM=gfdl-esm4 SCENARIO=ssp370 python run_process_model.py
+  RUN_PROCESS_MODEL=1 GCM=gfdl-esm4 SCENARIO=ssp370 python scripts/run_process_model.py
 
   # GDI only (skip loss and uncertainty)
-  RUN_PROCESS_MODEL=1 RUN_GDI_ONLY=1 GCM=gfdl-esm4 SCENARIO=ssp370 python run_process_model.py
+  RUN_PROCESS_MODEL=1 RUN_GDI_ONLY=1 GCM=gfdl-esm4 SCENARIO=ssp370 python scripts/run_process_model.py
 
   # skip existing outputs
-  RUN_PROCESS_MODEL=1 SKIP_EXISTING=1 python run_process_model.py
+  RUN_PROCESS_MODEL=1 SKIP_EXISTING=1 python scripts/run_process_model.py
 
 Environment variables
 ---------------------
@@ -66,7 +66,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ["RUN_PROCESS_MODEL"] = "1"
 os.environ.setdefault("SKIP_EXISTING", "1")

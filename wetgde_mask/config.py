@@ -67,7 +67,7 @@ EMAIL            = "n.g.otoo@uu.nl, REMOVED"
 INSTITUTION      = "Department of Physical Geography, Utrecht University"
 SUPERVISOR       = "Edwin H. Sutanudjaja"
 SUPERVISOR_EMAIL = "E.H.Sutanudjaja@uu.nl"
-PROJECT          = "PhD thesis, Utrecht University / IHE-Delft"
+PROJECT          = ""
 REFERENCES       = (
     "Otoo et al. (2025) HESS 29(8) 2153-2165; "
     "Sutanudjaja et al. (2018) GMD PCR-GLOBWB 2; "

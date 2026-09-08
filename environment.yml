@@ -1,0 +1,36 @@
+name: wetgde
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+
+  # Core scientific computing
+  - numpy
+  - pandas
+  - scipy
+  - xarray
+  - dask
+  - distributed
+  - numba
+
+  # NetCDF / array storage
+  - netcdf4
+  - h5netcdf
+  - cftime
+  - zarr
+  - bottleneck
+
+  # Tabular outputs
+  - pyarrow
+
+  # Geospatial processing
+  - geopandas
+  - rasterio
+  - shapely
+  - pyproj
+
+  # Plotting
+  - matplotlib
+  - cartopy

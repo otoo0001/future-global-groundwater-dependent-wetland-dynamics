@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SLURM and logs
+slurm-*.out
+slurm-*.err
+*.log
+
+# Model outputs
+*.nc
+*.nc4
+*.zarr/
+*.tif
+*.tiff
+*.parquet
+
+# Temporary files
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# Environments
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Backup files
+*.bak
+*.backup
+*.bak.*
+*.backup_*

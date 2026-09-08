@@ -33,7 +33,7 @@ from .grid_utils import lon_range, unify_longitudes, align_time
 
 
 START_YEAR = int(os.environ.get("START_YEAR", "1969"))
-END_YEAR   = int(os.environ.get("END_YEAR",   "2100"))
+END_YEAR   = int(os.environ.get("END_YEAR",   "2050"))
 
 
 try:

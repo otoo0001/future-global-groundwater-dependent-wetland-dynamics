@@ -37,4 +37,4 @@ echo "=== MASK ONLY ==="
 echo "SCENARIO: ${SCENARIO:-all}  START_YEAR: ${START_YEAR}"
 
 cd ~/github/paper_3/future_gdes_new_v2026
-/usr/bin/time -v "${PYBIN}" -u -X faulthandler run_wetgde_paper3.py
+/usr/bin/time -v "${PYBIN}" -u -X faulthandler scripts/run_wetgde_paper3.py

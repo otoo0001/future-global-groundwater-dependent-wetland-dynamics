@@ -75,5 +75,5 @@ echo "PCR_ISIMIP_ROOT: ${PCR_ISIMIP_ROOT}"
 echo "OUT_NC_DIR: ${OUT_NC_DIR}"
 
 cd ~/github/paper_3/future_gdes_new_v2026
-/usr/bin/time -v "${PYBIN}" -u -X faulthandler run_process_model.py 2>&1 \
+/usr/bin/time -v "${PYBIN}" -u -X faulthandler scripts/run_process_model.py 2>&1 \
   | tee -a "${LOG_DIR}/all_errors.log"

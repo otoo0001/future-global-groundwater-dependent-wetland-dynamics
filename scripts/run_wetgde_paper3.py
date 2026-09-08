@@ -8,23 +8,23 @@ Runs one or all scenarios. Each scenario writes one NetCDF file year by year:
 Usage
 -----
 # all scenarios
-python run_wetgde_paper3.py
+python scripts/run_wetgde_paper3.py
 
 # one scenario
-SCENARIO=ssp370 python run_wetgde_paper3.py
+SCENARIO=ssp370 python scripts/run_wetgde_paper3.py
 
 # small regional test
-SMALL_TEST=1 REGION=amazon SCENARIO=historical python run_wetgde_paper3.py
+SMALL_TEST=1 REGION=amazon SCENARIO=historical python scripts/run_wetgde_paper3.py
 
 # start from a specific year (skip earlier timesteps)
-START_YEAR=2015 SCENARIO=ssp370 python run_wetgde_paper3.py
+START_YEAR=2015 SCENARIO=ssp370 python scripts/run_wetgde_paper3.py
 """
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from wetgde_mask import config as cfg
 from wetgde_mask.io import open_sat, open_wtd

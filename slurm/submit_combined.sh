@@ -11,7 +11,7 @@ GCMS=(
 )
 SCENARIOS=("historical" "ssp126" "ssp370" "ssp585")
 
-SCRIPT="/path/to/user/github/paper_3/future_gdes_new_v2026/submit_gcms.sh"
+SCRIPT="/path/to/user/github/paper_3/future_gdes_new_v2026/slurm/submit_gcms.sh"
 LOG_DIR="/path/to/scratch/paper_3/new_outputs/WetGDEs_fgdw_v3/logs"
 mkdir -p "${LOG_DIR}"
 
